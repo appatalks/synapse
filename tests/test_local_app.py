@@ -426,6 +426,57 @@ class LocalAppTests(unittest.TestCase):
         self.assertEqual(self.runtime.status()["state"], "ready")
         self.assertEqual(self.runtime.status()["context"], 16384)
 
+    def tuning_hybrid_model(self, stem):
+        self.hybrid_runtime(hybrid_generic=True, hybrid_context=8192, hybrid_cache_mib=8192)
+        model = self.root / f"{stem}.gguf"
+        write_metadata(model, {"general.architecture": "qwen2moe", "general.file_type": 7,
+                               "qwen2moe.block_count": 3, "qwen2moe.embedding_length": 96,
+                               "qwen2moe.feed_forward_length": 192, "qwen2moe.expert_count": 7,
+                               "qwen2moe.expert_used_count": 3, "qwen2moe.context_length": 8192})
+        return model
+
+    def test_auto_tune_balanced_selects_hybrid_by_generation_speed(self):
+        for stem, mode in (("tuning-hybrid-decode", "hybrid"), ("tuning-hybrid-slow-decode", "standard")):
+            model = self.tuning_hybrid_model(stem)
+            code, _, body = self.request("POST", "/api/v1/tuning/start",
+                                        {"model": str(model), "confirm": True, "include_hybrid": True})
+            self.assertEqual(code, 202, body)
+            result = self.wait_tuning("completed")
+            speeds = {trial["settings"]["execution_mode"]: trial["decode_tokens_per_second"]
+                      for trial in result["trials"]}
+            self.assertEqual(speeds["standard"], 100.0)
+            self.assertEqual(result["recommendation"]["settings"]["execution_mode"], mode)
+            self.assertEqual(result["recommendation"]["selection_metric"], "generation speed")
+            self.assertEqual(result["recommendation"]["decode_tokens_per_second"], speeds[mode])
+            self.assertEqual(self.runtime.status()["execution_mode"], mode)
+            self.runtime.stop()
+
+    def test_auto_tune_maximum_selects_hybrid_by_long_prompt_time(self):
+        model = self.tuning_hybrid_model("tuning-hybrid-decode")
+        probe = self.server.tuner._probe
+
+        def timed(runtime, context):
+            result = probe(runtime, context)
+            result["request_seconds"] = 20.0 if runtime.hybrid_active else 10.0
+            return result
+
+        with mock.patch.object(self.server.tuner, "_probe", side_effect=timed):
+            code, _, body = self.request("POST", "/api/v1/tuning/start", {
+                "model": str(model), "confirm": True, "include_hybrid": True, "goal": "maximum"})
+            self.assertEqual(code, 202, body)
+            result = self.wait_tuning("completed")
+        self.assertEqual(result["recommendation"]["settings"]["execution_mode"], "standard")
+        self.assertEqual(result["recommendation"]["selection_metric"], "long-prompt request time")
+
+    def test_auto_tune_requires_a_reported_generation_speed(self):
+        model = self.root / "tuning-no-decode.gguf"
+        write_metadata(model, {"general.architecture": "fixture", "fixture.context_length": 8192})
+        self.assertEqual(self.request("POST", "/api/v1/tuning/start",
+                                     {"model": str(model), "confirm": True})[0], 202)
+        result = self.wait_tuning("error")
+        self.assertFalse(result["trials"][0]["capacity_passed"])
+        self.assertIn("generation speed", result["trials"][0]["error"])
+
     def test_auto_tune_cancellation_while_applying_restores_previous_settings(self):
         write_metadata(self.model, {"general.architecture": "fixture", "fixture.context_length": 8192})
         self.load(context=4096)
@@ -783,6 +834,16 @@ class LocalAppTests(unittest.TestCase):
         launch = json.loads(status["logs"][0])
         self.assertIsNone(launch["hybrid_hosted"])
         self.assertIsNone(launch["host_mailbox"])
+
+    def test_rejected_backend_arguments_explain_the_wrong_or_old_executable(self):
+        for stem, expected in (("not-a-server", "not a llama.cpp server"), ("old-server", "rejected --load-mode")):
+            model = self.root / f"{stem}.gguf"
+            write_metadata(model, {"general.architecture": "qwen3"})
+            code, _, body = self.request("POST", "/api/v1/model/load", {"model": str(model)})
+            self.assertEqual(code, 202, body)
+            status = self.wait_state("error")
+            self.assertIn(expected, status["error"])
+            self.runtime.stop()
 
     def test_hosted_moe_rejects_staged_transfer_and_mtp(self):
         self.runtime.stop(closing=True)

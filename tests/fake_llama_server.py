@@ -41,6 +41,10 @@ parser.add_argument("--flash-attn")
 parser.add_argument("--log-verbosity")
 parser.add_argument("--jinja", action="store_true")
 args, _ = parser.parse_known_args()
+if Path(args.model).stem in ("not-a-server", "old-server"):
+    print("error: invalid argument: " + ("--model" if Path(args.model).stem == "not-a-server" else "--load-mode"),
+          flush=True)
+    sys.exit(1)
 stats = {"tokens": 0, "decoded": 0}
 if Path(args.model).stem == "fail":
     print("Unsupported model architecture (test fixture).", flush=True)
@@ -178,6 +182,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/detokenize":
             self.send_json(200, {"content": bytes(data["tokens"]).decode()})
+            return
+        if self.path == "/completion":
+            if Path(args.model).stem == "tuning-no-decode":
+                self.send_json(200, {"content": "", "timings": {}})
+                return
+            hybrid = bool(os.getenv("VRAMBRIDGE_HYBRID_PLAN"))
+            rate = {"tuning-hybrid-decode": 150.0 if hybrid else 100.0,
+                    "tuning-hybrid-slow-decode": 90.0 if hybrid else 100.0}.get(Path(args.model).stem, 100.0)
+            self.send_json(200, {"content": "x" * data["n_predict"], "timings": {
+                "predicted_n": data["n_predict"], "predicted_per_second": rate,
+                "prompt_n": 18, "prompt_per_second": 900.0}})
             return
         prompt = data["messages"][-1]["content"]
         if prompt.startswith("SYNAPSE_TUNING_CHECK"):

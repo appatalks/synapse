@@ -104,8 +104,20 @@ Standard execution is the default. The optional **Include experimental hybrid
 trials** checkbox tests the largest passing standard context using the installed
 compatible profile. Unbound causal layouts may try progressively smaller expert
 banks; bound training plans retain their budget. Profiles and training plans are
-not rewritten. A passing hybrid trial is selected only if its prompt-plus-short-
-answer time is at least 5% lower; this does not establish broad answer quality.
+not rewritten. Every passing trial also measures generation speed: a short
+prompt, a 32-token warm-up, then 128 tokens at a fixed length. The goal decides
+which execution mode wins at the selected context:
+
+- **Balanced** selects hybrid only if its generation speed is at least 5% higher,
+  because everyday replies are dominated by generation.
+- **Maximum Context** selects hybrid only if its near-capacity
+  prompt-plus-answer time is at least 5% lower, because long prompts are
+  dominated by prompt processing.
+
+Trials show both, plus prompt-processing speed. Hybrid execution often
+generates faster but processes long prompts more slowly; for example, Qwen3-Coder-30B-A3B
+on a 16 GB GPU generated about 37% faster in hybrid at 16K but processed a 28K
+prompt at half the standard speed. None of this establishes broad answer quality.
 
 Other chat/load/unload/update operations are blocked during a run. **Cancel &
 restore** cancels a probe and attempts to reload the previous configuration.

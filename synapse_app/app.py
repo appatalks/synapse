@@ -100,6 +100,22 @@ def backend_executable(value: str) -> str | None:
     return shutil.which(value)
 
 
+BACKEND_ARGUMENT_ERROR = re.compile(
+    r"(?:invalid argument|unknown argument|unrecognized arguments?|unknown option|unknown flag)[:\s]+'?(-{1,2}[\w-]+)",
+    re.IGNORECASE)
+
+
+def backend_argument_error(argument: str, executable: str | None) -> str:
+    name = Path(executable or "llama-server").name
+    if argument in ("--model", "-m", "--port", "--host", "--api-key"):
+        return (f"{name} does not accept {argument}, so it is not a llama.cpp server. Point SYNAPSE at the "
+                "llama-server executable (llama-server.exe on Windows) from the same llama.cpp release, "
+                "not llama-cli, llama, LM Studio or Ollama tools.")
+    return (f"{name} rejected {argument}. This llama-server build is older or different from the "
+            f"llama.cpp b11669 (commit {PINNED_LLAMA_COMMIT[:7]}) release SYNAPSE targets; install that "
+            "release or newer. See backend output below.")
+
+
 class AppError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
@@ -1136,6 +1152,12 @@ class Runtime:
                                     self.context_warning = (f"Backend adjusted the requested {self.requested_context} context "
                                                             f"to {actual}. The displayed context is the actual slot size.")
                                     LOG.warning("%s", self.context_warning)
+                        rejected = BACKEND_ARGUMENT_ERROR.search(line)
+                        if rejected and self.state == "loading":
+                            self.state = "error"
+                            self.error = backend_argument_error(rejected[1], self.executable)
+                            LOG.error("%s", self.error)
+                            backend_failed = True
                         if self.placement == "auto" and "ggml_cuda_init: failed to initialize CUDA:" in line:
                             self.state = "error"
                             self.error = ("CUDA initialization failed. Automatic GPU placement was stopped "

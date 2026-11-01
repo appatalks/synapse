@@ -56,8 +56,10 @@ applies a passing configuration, then offers copyable VS Code/OpenAI-client limi
 Balanced daily use tests up to 32K; Maximum Context can test up to the model limit
 or 256K and take an hour or more. Experimental hybrid trials require a separate
 opt-in. Tuning temporarily owns the model; cancellation restores the previous
-configuration when possible. It tests input capacity and short anchor-retrieval
-replies, not general answer quality or an exhaustive speed search.
+configuration when possible. It tests input capacity, short anchor-retrieval
+replies and fixed-length generation speed. With hybrid trials, Balanced picks
+the faster generator and Maximum Context the faster long-prompt run. It is not a
+general answer-quality check or an exhaustive speed search.
 
 [Tuning scope, saved results and client settings](installing.md#auto-tune) ·
 [Optional Q8 attention cache](installing.md#optional-q8-attention-cache).

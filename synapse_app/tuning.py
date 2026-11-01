@@ -21,6 +21,9 @@ LOAD_FIELDS = ("model", "execution_mode", "context", "placement", "cpu_threads",
                "load_mode", "expert_cache_mib", "fit_target_mib", "host_op_offload", "cpu_poll",
                "op_offload_min_batch", "kv_cache_type", "draft_model", "draft_type", "draft_tokens")
 ANCHORS = {"start": "cedar4821", "middle": "violet7319", "end": "quartz9067"}
+DECODE_PROMPT = "Write a detailed technical explanation of how a hash table handles collisions.\n\n"
+DECODE_WARMUP_TOKENS = 32
+DECODE_TOKENS = 128
 
 
 class TrialError(RuntimeError):
@@ -161,10 +164,12 @@ class AutoTuner:
                 "progress": None, "trials": [], "recommendation": None, "error": None,
                 "hardware": {**hardware, "logical_cpus": self.cpu_count(), "ram_total_bytes": total,
                              "ram_available_at_start_bytes": available},
-                "scope": "Near-capacity input and short-answer checks; not a general quality or sustained-speed qualification.",
+                "scope": ("Near-capacity input, short-answer and fixed-length generation checks; not a general "
+                          "quality or sustained-speed qualification."),
             }
             self.worker = threading.Thread(
-                target=self._run, args=(runtime, model, contexts, placement, hybrid, metadata, previous, cache), daemon=True)
+                target=self._run, args=(runtime, model, contexts, placement, hybrid, metadata, previous, cache, goal),
+                daemon=True)
             self.worker.start()
         return self.snapshot()
 
@@ -206,10 +211,10 @@ class AutoTuner:
                 threading.Event().wait(0.1)
         raise TrialError("The backend did not become ready before its loading deadline.")
 
-    def _native(self, runtime, path: str, data: dict) -> dict:
+    def _native(self, runtime, path: str, data: dict, timeout: float = 30) -> dict:
         self._check(runtime)
         connection, key = runtime.connection()
-        connection.timeout = 30
+        connection.timeout = timeout
         try:
             connection.request("POST", path, json.dumps(data),
                                {"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
@@ -358,6 +363,21 @@ class AutoTuner:
             connection.close()
             thread.join(timeout=2)
 
+    def _decode(self, runtime) -> dict:
+        """Fixed-length generation after a short prompt: the speed of ordinary chat replies."""
+        rates = []
+        for tokens in (DECODE_WARMUP_TOKENS, DECODE_TOKENS):
+            result = self._native(runtime, "/completion", {
+                "prompt": DECODE_PROMPT, "n_predict": tokens, "ignore_eos": True, "temperature": 0,
+                "seed": 42, "cache_prompt": False}, timeout=900)
+            timings = result.get("timings")
+            generated = timings.get("predicted_n") if isinstance(timings, dict) else None
+            rate = timings.get("predicted_per_second") if isinstance(timings, dict) else None
+            if type(generated) is not int or generated < tokens // 2 or type(rate) not in (int, float) or rate <= 0:
+                raise TrialError("The backend did not report a valid fixed-length generation speed.")
+            rates.append(float(rate))
+        return {"decode_tokens_per_second": rates[-1], "decode_tokens": DECODE_TOKENS}
+
     def _trial(self, runtime, settings: dict) -> dict:
         self._check(runtime)
         trial = {"settings": settings, "capacity_passed": False}
@@ -373,7 +393,15 @@ class AutoTuner:
             if not runtime.chat_lock.acquire(blocking=False):
                 raise TrialError("Another request acquired the model during the tuning trial.")
             try:
-                trial.update(self._probe(runtime, settings["context"]))
+                probe = self._probe(runtime, settings["context"])
+                timings = probe.get("timings") if isinstance(probe.get("timings"), dict) else {}
+                for source, target in (("prompt_per_second", "prompt_tokens_per_second"),
+                                       ("predicted_per_second", "long_context_decode_tokens_per_second")):
+                    if type(timings.get(source)) in (int, float) and timings[source] > 0:
+                        probe[target] = float(timings[source])
+                self._update(phase=f"Measuring generation speed: {label}", detail="", progress=None)
+                probe.update(self._decode(runtime))
+                trial.update(probe)
             finally:
                 runtime.chat_lock.release()
         except (self.runtime_error, TrialError, OSError, ValueError, http.client.HTTPException) as exc:
@@ -399,7 +427,7 @@ class AutoTuner:
                 raise TrialError(f"Applied context {loaded['context']} differs from the selected {settings['context']}.")
 
     def _run(self, runtime, model: str, contexts: list[int], placement: str, hybrid: bool,
-             metadata: dict, previous: dict | None, cache: str) -> None:
+             metadata: dict, previous: dict | None, cache: str, goal: str = "balanced") -> None:
         original_budget = runtime.hybrid_context
         selected = None
         final_state = "completed"
@@ -432,7 +460,12 @@ class AutoTuner:
                                 "kv_cache_type": cache}
                     trial = self._trial(runtime, settings)
                     if trial["capacity_passed"]:
-                        if trial["request_seconds"] <= selected["request_seconds"] * 0.95:
+                        # Balanced favors everyday reply speed; Maximum favors long-prompt throughput.
+                        if goal == "balanced":
+                            faster = trial["decode_tokens_per_second"] >= selected["decode_tokens_per_second"] * 1.05
+                        else:
+                            faster = trial["request_seconds"] <= selected["request_seconds"] * 0.95
+                        if faster:
                             selected = trial
                         break
                     if not any(term in trial.get("error", "").lower() for term in
@@ -479,7 +512,10 @@ class AutoTuner:
                 recommendation = {"settings": selected["settings"],
                                   "apps": client_settings(selected["settings"]["context"]),
                                   "prompt_tokens_tested": selected["prompt_tokens"],
-                                  "request_seconds": selected["request_seconds"]}
+                                  "request_seconds": selected["request_seconds"],
+                                  "decode_tokens_per_second": selected["decode_tokens_per_second"],
+                                  "selection_metric": ("generation speed" if goal == "balanced"
+                                                       else "long-prompt request time")}
             with self.lock:
                 report = deepcopy(self.report)
             report.update(state=final_state, active=False, error=error, recommendation=recommendation,

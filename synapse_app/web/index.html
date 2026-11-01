@@ -133,7 +133,7 @@
           <h3 id="tuning-title">Auto Tune for this system</h3>
           <p>Measure this model on your hardware, then recommend model and app settings. Trials use synthetic local prompts; nothing is uploaded.</p>
           <label for="tuning-goal">Tuning goal</label>
-          <select id="tuning-goal"><option value="balanced">Balanced daily use (up to 32K)</option><option value="maximum">Maximum context (up to the model limit or 256K)</option></select>
+          <select id="tuning-goal"><option value="balanced">Balanced daily use (up to 32K, fastest generation)</option><option value="maximum">Maximum context (up to the model limit or 256K, fastest long prompts)</option></select>
           <label><input id="tuning-hybrid" type="checkbox"> Include experimental hybrid trials (not quality-qualified)</label>
           <p class="hint">Balanced tests input capacity, not every thread/cache combination. Maximum Context can take an hour or more. Hybrid fitting is off; trials may fail and use smaller expert banks.</p>
           <label><input id="tuning-consent" type="checkbox"> Allow unloading/reloading this model and running benchmarks. Other apps must wait. Cancel restores the previous model when possible.</label>

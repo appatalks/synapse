@@ -231,7 +231,9 @@ function renderTuning() {
     const settings = trial.settings;
     item.textContent = `${settings.execution_mode}, ${settings.context.toLocaleString()} context`
       + (settings.expert_cache_mib ? `, ${settings.expert_cache_mib} MiB expert bank` : "")
-      + (trial.capacity_passed ? `: passed ${trial.prompt_tokens.toLocaleString()} input tokens in ${elapsed(trial.request_seconds)}.`
+      + (trial.capacity_passed ? `: passed ${trial.prompt_tokens.toLocaleString()} input tokens in ${elapsed(trial.request_seconds)}`
+        + (trial.decode_tokens_per_second ? `; generation ${trial.decode_tokens_per_second.toFixed(1)} tok/s` : "")
+        + (trial.prompt_tokens_per_second ? `, prompt ${Math.round(trial.prompt_tokens_per_second).toLocaleString()} tok/s` : "") + "."
         : `: failed - ${trial.error || "no completed capacity check"}`);
     return item;
   }));
@@ -249,7 +251,9 @@ function renderTuning() {
     contextNote();
   }
   el("tuning-summary").textContent = `${current ? "Applied" : "Previous result; not currently applied"}: `
-    + `${settings.context.toLocaleString()} context, ${settings.execution_mode}. `
+    + `${settings.context.toLocaleString()} context, ${settings.execution_mode}`
+    + (recommendation.decode_tokens_per_second ? `, ${recommendation.decode_tokens_per_second.toFixed(1)} tok/s generation` : "")
+    + (recommendation.selection_metric ? ` (selected by ${recommendation.selection_metric})` : "") + ". "
     + `Verified ${recommendation.prompt_tokens_tested.toLocaleString()} input tokens and a short anchor-retrieval response. `
     + `Context ${apps.context.toLocaleString()}, response allowance ${apps.maxOutputTokens.toLocaleString()}, `
     + `safety margin ${apps.safetyMarginTokens.toLocaleString()} tokens. Model ID: local-model.`;
