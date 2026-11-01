@@ -62,7 +62,47 @@ replies, not general answer quality or an exhaustive speed search.
 [Tuning scope, saved results and client settings](installing.md#auto-tune) ·
 [Optional Q8 attention cache](installing.md#optional-q8-attention-cache).
 
+## Experimental speculative decoding
+
+Start SYNAPSE with `--experimental-speculation` to enable the explicit
+**Speculative decoding** selector under **Model Controls -> Advanced performance**.
+It stays Off unless you select a method and a matching local draft GGUF.
+
+- **DFlash:** Standard execution only, with a compatible target-trained DFlash
+  draft. Existing API requests supplying `draft_model` without `draft_type`
+  retain DFlash behavior.
+- **Native MTP:** the official llama.cpp adapter supports Standard, Automatic,
+  and experimental Hybrid execution with a matching native nextn draft. Strata's
+  `qwen4exp-mtp` files and runtime directories are not native MTP drafts.
+  Architecture, embedding dimensions, declared vocabulary sizes, and nextn
+  metadata are checked before launch; the backend must validate the remaining
+  tensor/tokenizer compatibility.
+
+The API uses `draft_type: "none" | "dflash" | "mtp"`, `draft_model`, and
+`draft_tokens`. MTP defaults to at most four proposals per verification.
+Hybrid MTP allows at most 31 proposals plus one target token, explicitly opts
+into the native hybrid-MTP path, and keeps the expert bank in the target context
+rather than the draft context. Every target slot must report active speculation
+before Ready; a backend that falls back to target-only execution fails verification.
+
+Drafts require additional VRAM. A target-only expert bank that fits may fail once
+a draft is added; reduce an unbound causal bank explicitly in Require hybrid
+mode rather than expecting an automatic fallback. Installed profiles and default
+execution settings are not rewritten. Auto Tune preserves the selected method
+when restoring a previous model, but its capacity trials do not benchmark drafting.
+
+MTP drafts may come from the stock model even when the target is modified.
+Acceptance, fit and speed must be measured against that exact target. Activation
+checks and accepted-token timings do not establish native-reference equivalence,
+general answer quality, or refusal behavior. Hybrid MTP remains experimental.
+
+Successful activation is not a speed recommendation. The local SC117 IQ3_S
+screen on the RTX 5070 Ti 16GB, at 16K context with four draft proposals, was
+slower with MTP in both Standard and Hybrid execution. Keep drafting Off unless
+benchmarks of your exact target, settings and hardware demonstrate a benefit.
+
 ## Updates without reinstalling
+
 
 Click the **version in the sidebar**. It lights up when a newer compatible
 public release is found. Managed installs can download a verified update and

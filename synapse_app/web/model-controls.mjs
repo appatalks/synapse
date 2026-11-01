@@ -11,6 +11,32 @@ export function loadingText(loading) {
   return `${loading.phase} · ${elapsed(loading.elapsed_seconds)} elapsed.${pending}${quiet}`;
 }
 
+export function draftControls(status, mode, type) {
+  const enabled = !!status?.speculation_enabled;
+  const mtp = status?.backend_kind === "llama.cpp";
+  return {
+    disabled: !enabled,
+    dflashDisabled: mode !== "standard",
+    mtpDisabled: !mtp,
+    inputDisabled: !enabled || type === "none" ||
+      (type === "dflash" && mode !== "standard") || (type === "mtp" && !mtp),
+    maximum: type === "mtp" && mode !== "standard" ? 31 : 32,
+  };
+}
+
+export function modelLoadPayload(settings) {
+  if (settings.execution_mode === "standard") return settings;
+  const payload = {
+    model: settings.model, execution_mode: settings.execution_mode, kv_cache_type: settings.kv_cache_type,
+    draft_type: settings.draft_type, draft_model: settings.draft_model, draft_tokens: settings.draft_tokens,
+  };
+  if (settings.execution_mode === "hybrid") Object.assign(payload, {
+    cpu_threads: settings.cpu_threads, batch_threads: settings.batch_threads, cpu_poll: settings.cpu_poll,
+    expert_cache_mib: settings.expert_cache_mib,
+  });
+  return payload;
+}
+
 export function bindReasoningEffort(primary, quick, invalid) {
   const values = new Set(["default", "low", "medium", "high"]);
   quick.value = primary.value;

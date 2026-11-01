@@ -15,8 +15,8 @@ from synapse_app.telemetry import SystemProbe
 from synapse_app.updates import download
 
 COMMIT = "620d2225cc436ab0b001e3200e590e3b286ef9ab"
-RESEARCH = "https://raw.githubusercontent.com/appatalks/unified-memory-scheduler/189db7f1ee3e087beccef790cf97cfcc9c0d335a"
-PATCH_SHA = "961544562fa0f9c45c1b5ee71e91196d693b01285572c40197c5c260df07319b"
+RESEARCH = "https://raw.githubusercontent.com/appatalks/unified-memory-scheduler/6b952cc5c1d88f44dd50e4097b9ad3d8f24effdc"
+PATCH_SHA = "990bd2ce296c3ad65918b684428c6a6340674619a9f1dc8a1ddee1d72a39d88f"
 PLAN_SHA = "6a679bec76f1a410ed65fa79c186d164a388fc76419d96dcad5978782343949c"
 
 

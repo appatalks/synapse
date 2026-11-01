@@ -46,10 +46,12 @@ RESPONSE_LIMIT = 8 * 1024 * 1024
 MAX_CONTEXT = 262144
 HYBRID_VERIFICATION_TIMEOUT = 60
 KV_VERIFICATION_TIMEOUT = 60
+SPECULATION_VERIFICATION_TIMEOUT = 60
 HYBRID_CHECK_LABELS = {
     "hybrid": "hybrid dispatcher activation", "coverage": "full routed-layer coverage",
     "context": "actual context size", "direct": "direct transfers", "registered": "host-memory registration",
     "staged": "bounded staging", "pipeline": "decode pipeline configuration", "async-ids": "protected GPU IDs",
+    "mtp": "bounded MTP target verification batches",
 }
 PINNED_LLAMA_COMMIT = "620d2225cc436ab0b001e3200e590e3b286ef9ab"
 HYBRID_WARNING = (
@@ -57,7 +59,7 @@ HYBRID_WARNING = (
     "Strict model diagnostics and an answer check remain failed. About 57 GiB of RAM stays pinned "
     "during the measured 120B direct-DMA profile; other layouts and staged transfers differ. "
     "Direct registration enforces a 64 GiB cap and 24 GiB available-RAM headroom. "
-    "Unload releases resources. Speculation is disabled."
+    "Unload releases resources. Speculation is disabled by default."
 )
 
 
@@ -187,7 +189,8 @@ def model_metadata(path: Path) -> dict:
               6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
     wanted = {"general.architecture", "general.file_type", "general.name", "split.count"}
     dimensions = {"block_count", "embedding_length", "feed_forward_length",
-                  "expert_feed_forward_length", "expert_count", "expert_used_count", "context_length"}
+                  "expert_feed_forward_length", "expert_count", "expert_used_count", "context_length",
+                  "nextn_predict_layers", "vocab_size"}
     with path.open("rb") as source:
         def read(count):
             if count < 0 or source.tell() + count > limit:
@@ -257,6 +260,28 @@ def model_metadata(path: Path) -> dict:
     return result
 
 
+def validate_mtp_draft(target: dict, draft: dict) -> None:
+    architecture = target.get("general.architecture")
+    if not isinstance(architecture, str) or draft.get("general.architecture") != architecture:
+        raise ValueError("MTP draft and target must have the same model architecture.")
+    prefix = architecture + "."
+    embedding = target.get(prefix + "embedding_length")
+    if (type(embedding) is not int or embedding <= 0 or
+            type(draft.get(prefix + "embedding_length")) is not int or
+            draft.get(prefix + "embedding_length") != embedding):
+        raise ValueError("MTP draft and target must have matching embedding dimensions.")
+    layers = draft.get(prefix + "nextn_predict_layers")
+    if type(layers) is not int or layers < 1:
+        raise ValueError("MTP draft must declare at least one nextn prediction layer; use a native MTP GGUF, not a Strata runtime pack.")
+    for metadata in (target, draft):
+        vocabulary = metadata.get(prefix + "vocab_size")
+        if vocabulary is not None and (type(vocabulary) is not int or vocabulary <= 0):
+            raise ValueError("MTP vocabulary dimensions must be positive integers.")
+    target_vocabulary, draft_vocabulary = target.get(prefix + "vocab_size"), draft.get(prefix + "vocab_size")
+    if target_vocabulary is not None and draft_vocabulary is not None and target_vocabulary != draft_vocabulary:
+        raise ValueError("MTP draft and target have different vocabulary sizes.")
+
+
 def moe_layout(metadata: dict) -> dict | None:
     architecture = metadata.get("general.architecture")
     if not isinstance(architecture, str):
@@ -311,12 +336,13 @@ def read_hybrid_profile(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     required = {"schema_version", "backend_commit", "executable", "plan", "cuda_plugin"}
     optional = {"model_layout", "context", "cache_mib", "transfer", "decode_pipeline", "async_ids",
-                "generic_cache_mib", "generic_transfer"}
+                "generic_cache_mib", "generic_transfer", "hosted_moe"}
     if (not isinstance(data, dict) or not required <= set(data) or set(data) - required - optional or
             type(data["schema_version"]) is not int or data["schema_version"] not in (1, 2) or
             data["backend_commit"] != PINNED_LLAMA_COMMIT or
             type(data.get("decode_pipeline", False)) is not bool or
             type(data.get("async_ids", False)) is not bool or
+            type(data.get("hosted_moe", False)) is not bool or
             (data.get("async_ids", False) and not data.get("decode_pipeline", False)) or
             ("generic_cache_mib" in data and (type(data["generic_cache_mib"]) is not int or
                                              not 1 <= data["generic_cache_mib"] <= 65536)) or
@@ -350,6 +376,7 @@ def read_hybrid_profile(path: Path) -> dict:
             "hybrid_transfer": data.get("transfer", "direct" if data["schema_version"] == 1 else "staged"),
             "hybrid_decode_pipeline": data.get("decode_pipeline", False),
             "hybrid_async_ids": data.get("async_ids", False),
+            "hybrid_hosted": data.get("hosted_moe", False),
             "hybrid_generic_cache_mib": data.get("generic_cache_mib"),
             "hybrid_generic_transfer": data.get("generic_transfer")}
 
@@ -362,7 +389,8 @@ class Runtime:
                  hybrid_layout: dict | None = None, hybrid_generic: bool = False,
                  hybrid_context: int = 16384, hybrid_cache_mib: int = 10240, hybrid_transfer: str = "direct",
                  hybrid_decode_pipeline: bool = False, hybrid_async_ids: bool = False,
-                 hybrid_generic_cache_mib: int | None = None, hybrid_generic_transfer: str | None = None):
+                 hybrid_generic_cache_mib: int | None = None, hybrid_generic_transfer: str | None = None,
+                 hybrid_hosted: bool = False):
         if backend_kind not in ("llama.cpp", "ik_llama.cpp"):
             raise ValueError("Unsupported backend kind.")
         if (hybrid_plan is None) != (hybrid_cuda_plugin is None):
@@ -385,6 +413,7 @@ class Runtime:
                                                          not 1 <= hybrid_generic_cache_mib <= 65536)) or
                 (hybrid_generic_transfer is not None and hybrid_generic_transfer not in ("direct", "staged")) or
                 type(hybrid_decode_pipeline) is not bool or type(hybrid_async_ids) is not bool or
+                type(hybrid_hosted) is not bool or
                 (hybrid_async_ids and not hybrid_decode_pipeline)):
             raise ValueError("Invalid generic hybrid context, residency budget, or transfer policy.")
         self.hybrid_plan = "auto" if hybrid_plan == "auto" else Path(hybrid_plan).resolve(strict=True) if hybrid_plan is not None else None
@@ -397,14 +426,15 @@ class Runtime:
         self.hybrid_generic_transfer = (hybrid_transfer if hybrid_plan == "auto" else "staged") if hybrid_generic_transfer is None else hybrid_generic_transfer
         self.hybrid_decode_pipeline = hybrid_decode_pipeline
         self.hybrid_async_ids = hybrid_async_ids
+        self.hybrid_hosted = hybrid_hosted
         self.active_hybrid_transfer = self.hybrid_generic_transfer if hybrid_plan == "auto" else hybrid_transfer
         self.required_hybrid_markers = {"hybrid", "context", "coverage", "direct", "registered"} if self.active_hybrid_transfer == "direct" else {"hybrid", "context", "coverage", "staged"}
         self.hybrid_cuda_plugin = hybrid_cuda_plugin.resolve(strict=True) if hybrid_cuda_plugin is not None else None
         self.hybrid_experts = 0
         self.hybrid_plan_sha256 = None
         if self.hybrid_plan is not None:
-            if backend_kind != "llama.cpp" or enable_speculation:
-                raise ValueError("Hybrid execution requires the patched official backend without speculation.")
+            if backend_kind != "llama.cpp":
+                raise ValueError("Hybrid execution requires the patched official backend.")
             if self.hybrid_plan != "auto":
                 self.hybrid_experts = validate_hybrid_plan(self.hybrid_plan, self.hybrid_layout)
                 self.hybrid_plan_sha256 = hashlib.sha256(self.hybrid_plan.read_bytes()).hexdigest()
@@ -449,7 +479,9 @@ class Runtime:
         self.kv_cache_verified = False
         self.flash_attention_verified: bool | None = None
         self.draft_model: str | None = None
+        self.draft_type = "none"
         self.draft_tokens = 9
+        self.speculation_verified = False
         self.resources: dict | None = None
         self.resource_error: str | None = None
         self.cpu_sample: tuple[float, float] | None = None
@@ -506,6 +538,21 @@ class Runtime:
                 self.generation["active"] = False
                 self.generation["final_pending"] = self.generation.get("tokens_per_second") is not None
 
+    def _backend_slots(self, port: int, key: str, timeout: float = 0.5) -> list[dict]:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            connection.request("GET", "/slots", headers={"Authorization": f"Bearer {key}"})
+            response = connection.getresponse()
+            body = response.read(1024 * 1024 + 1)
+            if response.status != 200 or len(body) > 1024 * 1024:
+                raise ValueError(f"Slot counters unavailable (HTTP {response.status})")
+            slots = json.loads(body)
+            if not isinstance(slots, list) or not slots or any(not isinstance(slot, dict) for slot in slots):
+                raise ValueError("Backend did not provide slot counters")
+            return slots
+        finally:
+            connection.close()
+
     def _monitor_backend(self) -> dict:
         with self.lock:
             process = self.process
@@ -533,16 +580,8 @@ class Runtime:
         if generation.get("error"):
             result["errors"]["generation"] = generation["error"]
         if state == "ready" and running:
-            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
             try:
-                connection.request("GET", "/slots", headers={"Authorization": f"Bearer {key}"})
-                response = connection.getresponse()
-                body = response.read(1024 * 1024 + 1)
-                if response.status != 200 or len(body) > 1024 * 1024:
-                    raise ValueError(f"Slot counters unavailable (HTTP {response.status})")
-                slots = json.loads(body)
-                if not isinstance(slots, list) or not slots or not isinstance(slots[0], dict):
-                    raise ValueError("Backend did not provide slot counters")
+                slots = self._backend_slots(port, key)
                 slot = slots[0]
                 result["context_used"] = number(slot.get("n_prompt_tokens"))
                 if result["context_used"] is not None:
@@ -558,8 +597,6 @@ class Runtime:
                         self.slot_sample = serial, now, count
             except (OSError, http.client.HTTPException, ValueError, TypeError) as exc:
                 result["errors"]["context"] = str(exc)
-            finally:
-                connection.close()
         if result["context_used"] is None and running:
             prompt, output = generation.get("prompt_tokens"), generation.get("output_tokens")
             if prompt is not None:
@@ -580,6 +617,8 @@ class Runtime:
                     waiting.append("Q8 attention K/V cache precision")
                 if self.flash_attention_verified is not True:
                     waiting.append("Flash Attention activation")
+            if self.draft_model is not None and self.backend_kind == "llama.cpp" and not self.speculation_verified:
+                waiting.append(f"{self.draft_type.upper()} speculative decoder activation")
             loading = None
             if self.state == "loading" and self.load_started is not None:
                 loading = {
@@ -604,6 +643,7 @@ class Runtime:
                 "backend": self.executable or self.requested_executable,
                 "backend_kind": self.backend_kind,
                 "speculation_enabled": self.enable_speculation,
+                "speculation_verified": self.speculation_verified,
                 "execution_mode": self.execution_mode,
                 "hybrid_available": self.hybrid_plan is not None,
                 "hybrid_plan_sha256": self.hybrid_plan_sha256,
@@ -616,6 +656,8 @@ class Runtime:
                 "hybrid_decode_pipeline": self.hybrid_active and self.hybrid_decode_pipeline,
                 "hybrid_async_ids": self.hybrid_active and self.hybrid_async_ids,
                 "hybrid_async_ids_verified": self.hybrid_active and "async-ids" in self.hybrid_markers,
+                "hybrid_hosted": self.hybrid_active and self.hybrid_hosted,
+                "hybrid_hosted_verified": self.hybrid_active and {"hosted", "lfu"} <= self.hybrid_markers,
                 "hybrid_overlap_verified": self.hybrid_active and "overlap" in self.hybrid_markers,
                 "hybrid_gate_up_verified": self.hybrid_active and "gate-up" in self.hybrid_markers,
                 "hybrid_context": self.context if self.hybrid_active else self.hybrid_context,
@@ -642,6 +684,7 @@ class Runtime:
                 "kv_cache_verified": self.kv_cache_verified,
                 "flash_attention_verified": self.flash_attention_verified,
                 "draft_model": self.draft_model,
+                "draft_type": self.draft_type,
                 "draft_tokens": self.draft_tokens,
                 "logical_cpus": len(available_cpus()),
                 "resources": self.resources,
@@ -766,7 +809,21 @@ class Runtime:
         op_offload_min_batch = data.get("op_offload_min_batch", 32)
         kv_cache_type = data.get("kv_cache_type", "f16")
         draft_value = data.get("draft_model")
-        draft_tokens = data.get("draft_tokens", 9)
+        draft_type = data.get("draft_type", "dflash" if draft_value not in (None, "") else "none")
+        draft_tokens = data.get("draft_tokens", 4 if draft_type == "mtp" else 9)
+        if draft_type not in ("none", "dflash", "mtp"):
+            raise AppError(400, "Draft type must be none, dflash, or mtp.")
+        if draft_type == "none" and draft_value not in (None, ""):
+            raise AppError(400, "Draft decoding is off, but a draft model was supplied.")
+        if draft_type != "none" and draft_value in (None, ""):
+            raise AppError(400, "Select a matching draft GGUF or turn speculative decoding off.")
+        if draft_type != "none" and not self.enable_speculation:
+            raise AppError(400, "Speculative decoding is disabled. Restart with --experimental-speculation "
+                           "and a compatible backend and target-trained draft.")
+        if draft_type == "mtp" and self.backend_kind != "llama.cpp":
+            raise AppError(400, "Native MTP requires the official llama.cpp backend with draft-mtp support.")
+        if hybrid and draft_type == "dflash":
+            raise AppError(400, "Hybrid speculation supports native MTP only; use Standard mode for DFlash.")
         if type(context) is not int or not 512 <= context <= MAX_CONTEXT:
             raise AppError(400, f"Context must be an integer between 512 and {MAX_CONTEXT}.")
         if placement not in ("auto", "cpu"):
@@ -803,11 +860,11 @@ class Runtime:
             raise AppError(400, "Operation offload minimum batch must be an integer between 1 and 8192.")
         if hybrid:
             if (placement != "auto" or context != planned_context or load_mode != "auto" or
-                    expert_cache_mib != selected_cache_mib or host_op_offload or draft_value not in (None, "") or
+                    expert_cache_mib != selected_cache_mib or host_op_offload or
                     fit_target_mib != 1024 or op_offload_min_batch != 32):
                 raise AppError(400, "The experimental hybrid profile requires automatic CPU/GPU execution, "
                                f"{planned_context} context, default loading, {selected_cache_mib} MiB residency, host-op offload off, "
-                               "1024 MiB reserve placeholder (fitting is off), batch threshold 32, and no draft.")
+                               "1024 MiB reserve placeholder (fitting is off), and batch threshold 32.")
             try:
                 selected_experts = validate_hybrid_plan(selected_plan, layout) if selected_plan != "auto" else 0
                 selected_plan_sha256 = hashlib.sha256(selected_plan.read_bytes()).hexdigest() if selected_plan != "auto" else None
@@ -819,16 +876,24 @@ class Runtime:
             raise AppError(400, "Explicit host-operation and polling tuning requires the official llama.cpp backend.")
         if type(draft_tokens) is not int or not 1 <= draft_tokens <= 32:
             raise AppError(400, "Draft tokens must be an integer between 1 and 32.")
+        if hybrid and self.hybrid_hosted and transfer != "direct":
+            raise AppError(400, "Hosted MoE execution requires direct registered transfers.")
+        if hybrid and self.hybrid_hosted and draft_type == "mtp":
+            raise AppError(400, "Hosted MoE execution has not been validated with MTP drafting; disable one of them.")
+        if hybrid and draft_type == "mtp" and draft_tokens > 31:
+            raise AppError(400, "Hybrid MTP allows at most 31 draft tokens: target verification includes one additional token.")
         draft = None
         if draft_value not in (None, ""):
-            if not self.enable_speculation:
-                raise AppError(400, "DFlash is disabled. It requires --experimental-speculation "
-                               "and a compatible backend and target-trained draft.")
-            if placement != "auto" or expert_cache_mib:
-                raise AppError(400, "DFlash requires automatic placement without an explicit expert cache.")
+            if placement != "auto" or (draft_type == "dflash" and expert_cache_mib):
+                raise AppError(400, "Draft decoding requires automatic placement; DFlash also requires no explicit expert cache.")
             draft = readable_gguf(draft_value, "Draft model")
-            if draft == model:
-                raise AppError(400, "The draft must be a separate, target-trained DFlash model.")
+            try:
+                if draft.samefile(model):
+                    raise ValueError("The draft must be a separate, target-trained model.")
+                if draft_type == "mtp":
+                    validate_mtp_draft(metadata or model_metadata(model), model_metadata(draft))
+            except (OSError, ValueError) as exc:
+                raise AppError(400, f"Cannot use draft model: {exc}") from exc
         with self.lock:
             if self.closed:
                 raise AppError(503, "The application is shutting down.")
@@ -876,20 +941,22 @@ class Runtime:
             if draft is not None:
                 command += ["--model-draft", str(draft)]
                 if self.backend_kind == "llama.cpp":
-                    command += ["--spec-type", "draft-dflash", "--spec-draft-n-max", str(draft_tokens),
-                                "--gpu-layers-draft", "all", "--jinja"]
+                    command += ["--spec-type", f"draft-{draft_type}", "--spec-draft-n-max", str(draft_tokens),
+                                "--gpu-layers-draft", "all"]
+                    if draft_type == "dflash":
+                        command += ["--jinja"]
                 else:
                     command += ["--spec-type", f"dflash:n_max={draft_tokens},p_min=0.0",
                                 "--gpu-layers-draft", "999"]
             if kv_cache_type == "q8_0":
                 command += ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--log-verbosity", "4"]
-            if draft is not None or kv_cache_type == "q8_0":
+            if draft_type == "dflash" or kv_cache_type == "q8_0":
                 command += ["--flash-attn", "on"]
             # Do not inherit placement overrides or credentials from a developer's shell.
             environment = {
                 key: value for key, value in os.environ.items()
                 if not key.startswith(("LLAMA_ARG_", "GGML_CUDA_ENABLE_UNIFIED_MEMORY", "VRAMBRIDGE_HYBRID_"))
-                and key not in ("GGML_OP_OFFLOAD_MIN_BATCH", "GGML_CUDA_REGISTER_HOST")
+                and key not in ("GGML_OP_OFFLOAD_MIN_BATCH", "GGML_CUDA_REGISTER_HOST", "GGML_CUDA_HOST_MAILBOX")
             }
             if hybrid:
                 environment.update(
@@ -905,6 +972,19 @@ class Runtime:
                         VRAMBRIDGE_HYBRID_BOUNDARY="gpu", VRAMBRIDGE_HYBRID_FUSE_GATE_UP="1")
                 if self.hybrid_async_ids:
                     environment["VRAMBRIDGE_HYBRID_ASYNC_IDS"] = "1"
+                if self.hybrid_hosted:
+                    # Expert calls run inside the graph; staged input and the boundary split belong to the
+                    # classic dispatcher. LFU 1/6 and the CUDA mailbox were validated on three MoE families.
+                    for name in ("VRAMBRIDGE_HYBRID_STAGE_INPUT", "VRAMBRIDGE_HYBRID_BOUNDARY"):
+                        environment.pop(name, None)
+                    environment.update(
+                        VRAMBRIDGE_HYBRID_HOSTED="1", GGML_CUDA_HOST_MAILBOX="1",
+                        VRAMBRIDGE_HYBRID_POLICY="lfu", VRAMBRIDGE_HYBRID_LFU_FILL="1",
+                        VRAMBRIDGE_HYBRID_LFU_ADMIT="6")
+                if draft_type == "mtp":
+                    environment["VRAMBRIDGE_HYBRID_BATCH"] = str(draft_tokens + 1)
+            if draft_type == "mtp":
+                environment["VRAMBRIDGE_HYBRID_MTP"] = "1"
             if self.backend_kind == "llama.cpp":
                 environment["GGML_OP_OFFLOAD_MIN_BATCH"] = str(op_offload_min_batch)
             self.logs.clear()
@@ -916,10 +996,16 @@ class Runtime:
             self.active_hybrid_transfer = transfer
             self.required_hybrid_markers = ({"hybrid", "context", "coverage", "direct", "registered"}
                                             if transfer == "direct" else {"hybrid", "context", "coverage", "staged"})
-            if hybrid and self.hybrid_decode_pipeline:
+            if hybrid and self.hybrid_hosted:
+                self.required_hybrid_markers |= {"hosted", "lfu"}
+                if self.hybrid_decode_pipeline:
+                    self.required_hybrid_markers.add("gate-up")
+            elif hybrid and self.hybrid_decode_pipeline:
                 self.required_hybrid_markers.add("pipeline")
             if hybrid and self.hybrid_async_ids:
                 self.required_hybrid_markers.add("async-ids")
+            if hybrid and draft_type == "mtp":
+                self.required_hybrid_markers.add("mtp")
             self.execution_mode = mode
             self.selection_reason = reason
             self.error = None
@@ -941,7 +1027,9 @@ class Runtime:
             self.kv_cache_verified = False
             self.flash_attention_verified = None
             self.draft_model = str(draft) if draft is not None else None
+            self.draft_type = draft_type
             self.draft_tokens = draft_tokens
+            self.speculation_verified = False
             self.resources = None
             self.resource_error = None
             self.cpu_sample = None
@@ -1012,6 +1100,14 @@ class Runtime:
                             coverage = re.search(r"tensor-derived hybrid coverage=(\d+)/(\d+) routed layers", line)
                             if coverage and int(coverage[1]) > 0 and coverage[1] == coverage[2]:
                                 self.hybrid_markers.add("coverage")
+                            batch = re.search(r"hybrid batch limit=(\d+); multi-position dispatch freezes residency", line)
+                            if self.draft_type == "mtp" and batch and int(batch[1]) == self.draft_tokens + 1:
+                                self.hybrid_markers.add("mtp")
+                            if self.hybrid_hosted:
+                                if "VRAMBridge hosted MoE enabled:" in line and "in-graph host expert calls" in line:
+                                    self.hybrid_markers.add("hosted")
+                                if "admission policy=lfu;" in line:
+                                    self.hybrid_markers.add("lfu")
                             if self.hybrid_decode_pipeline:
                                 if "VRAMBridge decode pipeline configured: staged input, guarded overlap, GPU boundary, gate/up fusion" in line:
                                     self.hybrid_markers.add("pipeline")
@@ -1067,6 +1163,7 @@ class Runtime:
                     return
                 loading = self.state == "loading"
                 port, key = self.port, self.key
+                verify_speculation = self.draft_model is not None and self.backend_kind == "llama.cpp"
             self._sample_resources(process)
             if loading:
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
@@ -1084,17 +1181,28 @@ class Runtime:
                                 if self.kv_cache_type == "q8_0" and (
                                         not self.kv_cache_verified or self.flash_attention_verified is not True):
                                     self.loading_phase = "Verifying Q8 cache and Flash Attention"
+                                if verify_speculation and not self.speculation_verified:
+                                    self.loading_phase = f"Verifying {self.draft_type.upper()} speculative decoding"
+                        if verify_speculation:
+                            slots = self._backend_slots(port, key, timeout=1)
+                            if not all(slot.get("speculative") is True for slot in slots):
+                                raise ValueError("Backend did not confirm active speculative decoding in every slot.")
+                            with self.lock:
+                                if self.process is process and self.state == "loading":
+                                    self.speculation_verified = True
+                        with self.lock:
                             if (self.process is process and self.state == "loading" and
                                     (not self.hybrid_active or
                                      self.required_hybrid_markers <= self.hybrid_markers) and
                                     (self.kv_cache_type != "q8_0" or
-                                     (self.kv_cache_verified and self.flash_attention_verified is True))):
+                                     (self.kv_cache_verified and self.flash_attention_verified is True)) and
+                                    (not verify_speculation or self.speculation_verified)):
                                 self.state = "ready"
                     else:
                         with self.lock:
                             if self.process is process:
                                 self.readiness_error = f"Backend readiness returned HTTP {response.status}"
-                except (OSError, http.client.HTTPException) as exc:
+                except (OSError, http.client.HTTPException, ValueError, TypeError) as exc:
                     with self.lock:
                         if self.process is process:
                             self.readiness_error = f"Backend readiness is unavailable: {exc}"
@@ -1106,8 +1214,11 @@ class Runtime:
                     cache_expired = (self.kv_cache_type == "q8_0" and self.backend_ready_at is not None and
                                      time.monotonic() - self.backend_ready_at >= KV_VERIFICATION_TIMEOUT and
                                      (not self.kv_cache_verified or self.flash_attention_verified is not True))
+                    speculation_expired = (verify_speculation and not self.speculation_verified and
+                                           self.backend_ready_at is not None and
+                                           time.monotonic() - self.backend_ready_at >= SPECULATION_VERIFICATION_TIMEOUT)
                     if (self.process is process and self.state == "loading"
-                            and (time.monotonic() >= deadline or verification_expired or cache_expired)):
+                            and (time.monotonic() >= deadline or verification_expired or cache_expired or speculation_expired)):
                         self._terminate(process)
                         self.state = "error"
                         missing = ", ".join(sorted(self.required_hybrid_markers - self.hybrid_markers))
@@ -1122,6 +1233,10 @@ class Runtime:
                                              (not self.kv_cache_verified or self.flash_attention_verified is not True)):
                             self.error = ("Q8 cache verification timed out: the backend must confirm q8_0 for both "
                                           "attention K/V caches and enabled Flash Attention. Check backend output.")
+                        if verify_speculation and not self.speculation_verified:
+                            self.error = (f"{self.draft_type.upper()} speculation verification timed out: "
+                                          "the backend must confirm an active speculative decoder in every slot. "
+                                          "Target-only fallback is not accepted. " + (self.readiness_error or "Check backend output."))
                         LOG.error("%s", self.error)
                         return
             time.sleep(0.2)
@@ -1185,6 +1300,7 @@ class Runtime:
                 self.resource_error = None
                 self.cpu_sample = None
                 self.hybrid_markers.clear()
+                self.speculation_verified = False
                 self.generation_serial += 1
                 self.generation = {}
                 self.slot_sample = None
@@ -1549,7 +1665,7 @@ def main() -> None:
     parser.add_argument("--backend-kind", choices=("llama.cpp", "ik_llama.cpp"), default="llama.cpp",
                         help="explicit backend flag adapter; ik_llama.cpp is experimental")
     parser.add_argument("--experimental-speculation", action="store_true",
-                        help="allow opt-in DFlash draft models; requires a compatible backend")
+                        help="allow opt-in DFlash or native MTP drafts; Hybrid supports MTP only, with a compatible patched backend")
     parser.add_argument("--experimental-hybrid-plan",
                         help="require experimental routed-MoE execution with a model-specific plan file, or auto for causal cold start")
     parser.add_argument("--hybrid-cuda-plugin", type=Path,

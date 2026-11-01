@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { bindReasoningEffort, elapsed, loadingText, ModelPrecheck, precheckText } from "../synapse_app/web/model-controls.mjs";
+import { bindReasoningEffort, draftControls, elapsed, loadingText, modelLoadPayload, ModelPrecheck, precheckText } from "../synapse_app/web/model-controls.mjs";
 
 class Select extends EventTarget {
   constructor(value) { super(); this.value = value; }
@@ -109,4 +109,36 @@ test("empty paths do not send inspection requests", async () => {
   await view.check();
   assert.match(output.textContent, /Enter a local GGUF path/);
   assert.equal(view.busy, false);
+});
+
+test("draft controls preserve default-off behavior and restrict Hybrid to native MTP", () => {
+  const status = { speculation_enabled: true, backend_kind: "llama.cpp" };
+  assert.equal(draftControls({ ...status, speculation_enabled: false }, "standard", "mtp").disabled, true);
+  assert.equal(draftControls(status, "standard", "none").inputDisabled, true);
+  assert.equal(draftControls(status, "standard", "dflash").inputDisabled, false);
+  assert.equal(draftControls(status, "hybrid", "dflash").inputDisabled, true);
+  assert.equal(draftControls(status, "hybrid", "mtp").inputDisabled, false);
+  assert.equal(draftControls(status, "auto", "mtp").inputDisabled, false);
+  assert.equal(draftControls(status, "hybrid", "mtp").maximum, 31);
+  assert.equal(draftControls(status, "standard", "mtp").maximum, 32);
+  const experimental = draftControls({ ...status, backend_kind: "ik_llama.cpp" }, "standard", "mtp");
+  assert.equal(experimental.mtpDisabled, true);
+  assert.equal(experimental.inputDisabled, true);
+});
+
+test("Automatic and Hybrid payloads retain the explicit MTP draft instead of silently dropping it", () => {
+  const settings = { model: "/models/target.gguf", execution_mode: "hybrid", context: 16384,
+    cpu_threads: 8, batch_threads: 16, cpu_poll: 50, expert_cache_mib: 6144, kv_cache_type: "f16",
+    draft_type: "mtp", draft_model: "/models/mtp.gguf", draft_tokens: 4 };
+  assert.deepEqual(modelLoadPayload(settings), {
+    model: settings.model, execution_mode: "hybrid", kv_cache_type: "f16",
+    draft_type: "mtp", draft_model: settings.draft_model, draft_tokens: 4,
+    cpu_threads: 8, batch_threads: 16, cpu_poll: 50, expert_cache_mib: 6144,
+  });
+  assert.deepEqual(modelLoadPayload({ ...settings, execution_mode: "auto" }), {
+    model: settings.model, execution_mode: "auto", kv_cache_type: "f16",
+    draft_type: "mtp", draft_model: settings.draft_model, draft_tokens: 4,
+  });
+  const standard = { ...settings, execution_mode: "standard", draft_type: "dflash" };
+  assert.equal(modelLoadPayload(standard), standard);
 });

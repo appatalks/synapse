@@ -115,11 +115,13 @@
                 <p id="cache-note">Experimental expert caching can be slower. Zero disables it.</p>
                 <label for="fit-target">VRAM reserve (MiB)</label>
                 <input id="fit-target" type="number" value="1024" min="128" max="65536" step="1" required>
-                <label for="draft-model">DFlash draft GGUF (optional)</label>
+                <label for="draft-type">Speculative decoding (experimental)</label>
+                <select id="draft-type"><option value="none">Off</option><option value="dflash">DFlash (Standard only)</option><option value="mtp">Native MTP</option></select>
+                <label for="draft-model">Matching draft GGUF</label>
                 <input id="draft-model" placeholder="/path/to/target-trained-dflash.gguf" autocomplete="off" spellcheck="false">
                 <label for="draft-tokens">Draft tokens per verification</label>
                 <input id="draft-tokens" type="number" value="9" min="1" max="32" step="1" required>
-                <p>A compatible target-trained draft and extra VRAM are required. Fit, quality and speed are not guaranteed.</p>
+                <p>MTP requires a native nextn draft, not a Strata runtime pack. Drafts require extra VRAM; Hybrid MTP verifies up to 31 proposals plus one target token. Fit, quality and speed are not guaranteed.</p>
                 <p id="speculation-note"></p>
               </details>
             </details>

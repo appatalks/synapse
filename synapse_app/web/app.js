@@ -5,7 +5,7 @@ import { navigate } from "./navigation.mjs";
 import { MonitorView } from "./monitor.mjs";
 import { UpdateView } from "./updates.mjs";
 import { bindChatInput } from "./chat-input.mjs";
-import { bindReasoningEffort, elapsed, loadingText, ModelPrecheck } from "./model-controls.mjs";
+import { bindReasoningEffort, draftControls, elapsed, loadingText, modelLoadPayload, ModelPrecheck } from "./model-controls.mjs";
 
 const el = (id) => document.getElementById(id);
 let status = null;
@@ -63,7 +63,7 @@ function controls() {
   }
   el("browser-path").disabled = active || actionPending || browserBusy;
   if (browserLocation && !browserLocation.parent) el("browser-up").disabled = true;
-  for (const id of ["model", "context", "placement", "kv-cache-type", "cpu-threads", "batch-threads", "cpu-poll", "host-op-offload", "op-offload-min-batch", "load-mode", "expert-cache", "fit-target", "draft-model", "draft-tokens"]) {
+  for (const id of ["model", "context", "placement", "kv-cache-type", "cpu-threads", "batch-threads", "cpu-poll", "host-op-offload", "op-offload-min-batch", "load-mode", "expert-cache", "fit-target", "draft-type", "draft-model", "draft-tokens"]) {
     el(id).disabled = active || actionPending;
   }
   el("execution-mode").disabled = active || actionPending;
@@ -73,9 +73,12 @@ function controls() {
       el(id).disabled = true;
     }
   }
-  for (const id of ["draft-model", "draft-tokens"]) {
-    el(id).disabled = active || actionPending || selectedMode === "auto" || !status?.speculation_enabled;
-  }
+  const draft = draftControls(status, selectedMode, el("draft-type").value);
+  el("draft-type").disabled = active || actionPending || draft.disabled;
+  el("draft-type").querySelector('option[value="dflash"]').disabled = draft.dflashDisabled;
+  el("draft-type").querySelector('option[value="mtp"]').disabled = draft.mtpDisabled;
+  for (const id of ["draft-model", "draft-tokens"]) el(id).disabled = active || actionPending || draft.inputDisabled;
+  el("draft-tokens").max = draft.maximum;
   if (status?.backend_kind !== "llama.cpp") {
     el("kv-cache-type").disabled = true;
     el("cpu-poll").disabled = true;
@@ -122,7 +125,7 @@ function renderStatus() {
   if (status.hybrid_generic) el("cache-note").textContent +=
     " Require hybrid mode allows a smaller manual cache for unbound causal layouts. Bound training plans retain their configured budget. Automatic defaults are unchanged.";
   el("speculation-note").textContent = status.speculation_enabled
-    ? "Experimental speculation is enabled. A compatible target-trained draft and backend are required; speed is not guaranteed."
+    ? "Experimental speculation is enabled. Native MTP supports Standard and Hybrid with a compatible backend; DFlash is Standard only. Extra VRAM and a matching draft are required. Hybrid MTP may need a smaller expert bank. Speed and quality are not guaranteed."
     : "Speculation is disabled by default. Research trials require --experimental-speculation at launch.";
   el("cpu-threads").max = status.logical_cpus;
   el("batch-threads").max = status.logical_cpus;
@@ -140,7 +143,7 @@ function renderStatus() {
   el("controls-action-status").textContent = labels[status.state] || status.state;
   el("model-status").textContent = status.model || "No model loaded.";
   el("run-status").textContent = status.model
-    ? `${status.backend_kind}${experimental || hybrid ? " (experimental)" : ""} · ${hybrid ? `Hybrid ${transfer}${status.hybrid_verified ? " (activation verified)" : " (verifying activation)"}` : status.placement === "cpu" ? "CPU only" : "Automatic placement"} · ${status.context.toLocaleString()} context · ${status.cpu_threads} generation / ${status.batch_threads} prompt threads · ${status.load_mode} loading · ${status.expert_cache_mib} MiB ${hybrid ? "resident expert bank · fitting off" : `expert cache · ${status.fit_target_mib} MiB reserve`} · polling ${status.cpu_poll} · host-op offload ${status.host_op_offload ? "on" : "off"} (min batch ${status.op_offload_min_batch})${status.draft_model ? ` · DFlash (${status.draft_tokens} draft tokens)` : ""}`
+    ? `${status.backend_kind}${experimental || hybrid ? " (experimental)" : ""} · ${hybrid ? `Hybrid ${transfer}${status.hybrid_verified ? " (activation verified)" : " (verifying activation)"}` : status.placement === "cpu" ? "CPU only" : "Automatic placement"} · ${status.context.toLocaleString()} context · ${status.cpu_threads} generation / ${status.batch_threads} prompt threads · ${status.load_mode} loading · ${status.expert_cache_mib} MiB ${hybrid ? "resident expert bank · fitting off" : `expert cache · ${status.fit_target_mib} MiB reserve`} · polling ${status.cpu_poll} · host-op offload ${status.host_op_offload ? "on" : "off"} (min batch ${status.op_offload_min_batch})${status.draft_model ? ` · ${status.draft_type === "mtp" ? "MTP" : "DFlash"} (up to ${status.draft_tokens} draft tokens${status.speculation_verified ? ", activation verified" : ", activation unverified"})` : ""}`
     : "Load an existing GGUF to begin.";
   if (status.model) el("run-status").textContent += ` · Attention KV ${status.kv_cache_type || "f16"}`
     + (status.kv_cache_verified ? " (backend confirmed)" : " (backend confirmation unavailable)");
@@ -183,6 +186,7 @@ function renderStatus() {
     el("expert-cache").value = status.expert_cache_mib;
     el("fit-target").value = status.fit_target_mib;
     el("draft-model").value = status.draft_model || "";
+    el("draft-type").value = status.draft_type || (status.draft_model ? "dflash" : "none");
     el("draft-tokens").value = status.draft_tokens;
     settingsInitialized = true;
   }
@@ -384,6 +388,8 @@ el("browser-path").addEventListener("keydown", (event) => {
   }
 });
 el("execution-mode").addEventListener("change", () => {
+  el("draft-type").value = "none";
+  el("draft-model").value = "";
   if (el("execution-mode").value !== "auto") {
     const hybrid = el("execution-mode").value === "hybrid";
     el("context").value = hybrid ? String(status.hybrid_context) : "4096";
@@ -397,6 +403,17 @@ el("execution-mode").addEventListener("change", () => {
     el("load-mode").value = "auto";
     el("draft-model").value = "";
   }
+  controls();
+});
+
+el("draft-type").addEventListener("change", () => {
+  const type = el("draft-type").value;
+  if (!["none", "dflash", "mtp"].includes(type)) {
+    notice("Select a supported speculative decoding method.");
+    return;
+  }
+  el("draft-tokens").value = type === "mtp" ? "4" : "9";
+  el("draft-model").placeholder = type === "mtp" ? "/path/to/native-mtp.gguf" : "/path/to/target-trained-dflash.gguf";
   controls();
 });
 
@@ -472,15 +489,12 @@ el("load-form").addEventListener("submit", async (event) => {
       load_mode: el("load-mode").value,
       expert_cache_mib: Number(el("expert-cache").value),
       fit_target_mib: Number(el("fit-target").value),
-      draft_model: status?.speculation_enabled ? el("draft-model").value.trim() || null : null,
+      draft_type: status?.speculation_enabled ? el("draft-type").value : "none",
+      draft_model: status?.speculation_enabled && el("draft-type").value !== "none"
+        ? el("draft-model").value.trim() || null : null,
       draft_tokens: Number(el("draft-tokens").value),
     };
-    const payload = settings.execution_mode === "auto"
-      ? { model: settings.model, execution_mode: "auto", kv_cache_type: settings.kv_cache_type }
-      : settings.execution_mode === "hybrid" ? { model: settings.model, execution_mode: "hybrid",
-        cpu_threads: settings.cpu_threads, batch_threads: settings.batch_threads, cpu_poll: settings.cpu_poll,
-        expert_cache_mib: settings.expert_cache_mib, kv_cache_type: settings.kv_cache_type }
-      : settings;
+    const payload = modelLoadPayload(settings);
     status = await request("/api/v1/model/load", payload);
     clearChat();
     el("model-browser").hidden = true;

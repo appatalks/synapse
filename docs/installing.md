@@ -65,6 +65,22 @@ The Q8 preset also enables the pinned backend's library-info diagnostics
 (`--log-verbosity 4`) so these confirmations are visible. Debug and verbose-prompt
 logging are not enabled, and backend authentication diagnostic lines are redacted.
 
+### Optional native MTP drafting
+
+Launch with `--experimental-speculation`, then choose **Native MTP** under
+**Model Controls -> Advanced performance**, select a compatible native MTP
+GGUF, and start with four draft tokens. The official llama.cpp backend must
+support `draft-mtp` and report an active speculative decoder through `/slots`.
+The existing DFlash method remains Standard-only; drafting stays Off by default.
+
+Hybrid MTP also requires the matching patched backend's native MTP and
+multi-position hybrid dispatch hooks. It verifies up to 31 proposals plus one
+target token and needs extra draft VRAM. Reduce the causal expert-bank budget
+explicitly if the combined target/draft does not fit. No smaller context, changed
+weights, or target-only fallback is silently substituted.
+
+[Draft compatibility, API fields and qualification limits](application_notes.md#experimental-speculative-decoding).
+
 ## Auto Tune
 
 Open **Model Controls -> Auto Tune for this system**, choose a goal and explicitly
@@ -144,6 +160,16 @@ research direct-DMA budgets and a training plan bound to the exact GPT layout;
 other routed layouts use their own causal initialization, never that plan.
 Actual tensors, capacities, registration/headroom and activation are validated
 again by the backend. Desktop load and model/context size can still cause OOM.
+
+Profiles can opt into hosted MoE execution with `"hosted_moe": true`. CPU
+experts then run inside the CUDA graph through a pinned mailbox while the GPU
+computes resident experts, with frequency-gated admissions (free slot after one
+use, replacement after six). It requires direct transfers and the CUDA plugin
+built from the patched checkout; it is rejected with MTP drafting until that
+pairing is validated. Loading fails unless the backend confirms hosted
+execution and the LFU policy. In local screens it was about 30% faster on
+Qwen3-Coder-30B-A3B, neutral on a 512-expert Qwen3.8 model, and about 6% slower
+on gpt-oss-120b, so it stays off by default.
 
 This is **experimental Linux/NVIDIA code**, not a production-qualified model
 executor. CPU/native numerical and answer checks remain unresolved. No model

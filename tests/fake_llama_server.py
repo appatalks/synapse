@@ -39,6 +39,7 @@ parser.add_argument("--cache-type-k")
 parser.add_argument("--cache-type-v")
 parser.add_argument("--flash-attn")
 parser.add_argument("--log-verbosity")
+parser.add_argument("--jinja", action="store_true")
 args, _ = parser.parse_known_args()
 stats = {"tokens": 0, "decoded": 0}
 if Path(args.model).stem == "fail":
@@ -80,12 +81,17 @@ print(json.dumps({
     "hybrid_async": os.getenv("VRAMBRIDGE_HYBRID_ASYNC"),
     "hybrid_direct": os.getenv("VRAMBRIDGE_HYBRID_DIRECT"),
     "hybrid_batch": os.getenv("VRAMBRIDGE_HYBRID_BATCH"),
+    "hybrid_mtp": os.getenv("VRAMBRIDGE_HYBRID_MTP"),
     "hybrid_repack": os.getenv("VRAMBRIDGE_HYBRID_REPACK"),
     "hybrid_stage_input": os.getenv("VRAMBRIDGE_HYBRID_STAGE_INPUT"),
     "hybrid_overlap": os.getenv("VRAMBRIDGE_HYBRID_OVERLAP"),
     "hybrid_boundary": os.getenv("VRAMBRIDGE_HYBRID_BOUNDARY"),
     "hybrid_fuse_gate_up": os.getenv("VRAMBRIDGE_HYBRID_FUSE_GATE_UP"),
     "hybrid_async_ids": os.getenv("VRAMBRIDGE_HYBRID_ASYNC_IDS"),
+    "hybrid_hosted": os.getenv("VRAMBRIDGE_HYBRID_HOSTED"),
+    "hybrid_policy": os.getenv("VRAMBRIDGE_HYBRID_POLICY"),
+    "hybrid_lfu": [os.getenv("VRAMBRIDGE_HYBRID_LFU_FILL"), os.getenv("VRAMBRIDGE_HYBRID_LFU_ADMIT")],
+    "host_mailbox": os.getenv("GGML_CUDA_HOST_MAILBOX"),
     "register_host": os.getenv("GGML_CUDA_REGISTER_HOST"),
     "cuda_plugin": os.getenv("GGML_BACKEND_PATH"),
     "no_repack": args.no_repack,
@@ -93,6 +99,7 @@ print(json.dumps({
     "cache_type_k": args.cache_type_k,
     "cache_type_v": args.cache_type_v,
     "flash_attn": args.flash_attn,
+    "jinja": args.jinja,
 }), flush=True)
 cache = "f16" if Path(args.model).stem == "q8-cache-fallback" else args.cache_type_k or "f16"
 if args.log_verbosity == "4":
@@ -113,7 +120,18 @@ if os.getenv("VRAMBRIDGE_HYBRID_PLAN") and Path(args.model).stem != "hybrid-no-m
     if os.getenv("VRAMBRIDGE_HYBRID_ASYNC_IDS") == "1" and Path(args.model).stem != "hybrid-no-async-ids":
         print("impl: asynchronous GPU ID handoff: 1024-byte per-layer pinned staging; protected reuse", flush=True)
     print(f"impl: tensor-derived hybrid coverage={coverage} routed layers; other layers remain native", flush=True)
-    if os.getenv("VRAMBRIDGE_HYBRID_OVERLAP") == "1" and Path(args.model).stem != "hybrid-no-pipeline":
+    if os.getenv("VRAMBRIDGE_HYBRID_MTP") == "1" and Path(args.model).stem != "hybrid-mtp-no-batch":
+        print(f"impl: hybrid batch limit={os.environ['VRAMBRIDGE_HYBRID_BATCH']}; multi-position dispatch freezes residency", flush=True)
+    hosted = os.getenv("VRAMBRIDGE_HYBRID_HOSTED") == "1"
+    if os.getenv("VRAMBRIDGE_HYBRID_POLICY") == "lfu":
+        print("impl: admission policy=lfu; recent token window=64", flush=True)
+    if hosted and Path(args.model).stem != "hybrid-hosted-missing":
+        print("init_hosted: VRAMBridge hosted MoE enabled: 2 layers; device slot maps, in-graph host expert calls, "
+              "deferred admissions", flush=True)
+    if hosted:
+        if os.getenv("VRAMBRIDGE_HYBRID_FUSE_GATE_UP") == "1":
+            print("VRAMBridge resident gate/up projection fusion active", flush=True)
+    elif os.getenv("VRAMBRIDGE_HYBRID_OVERLAP") == "1" and Path(args.model).stem != "hybrid-no-pipeline":
         print("VRAMBridge decode pipeline configured: staged input, guarded overlap, GPU boundary, gate/up fusion", flush=True)
         if Path(args.model).stem != "hybrid-pipeline-pending":
             print("VRAMBridge guarded expert overlap active", flush=True)
@@ -146,6 +164,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.authorized():
             if self.path == "/slots":
                 self.send_json(200, [{"id": 0, "n_ctx": int(args.ctx_size), "n_prompt_tokens": stats["tokens"],
+                                     "speculative": bool(args.model_draft and args.spec_type) and Path(args.model).stem != "mtp-fallback",
                                      "next_token": [{"n_decoded": stats["decoded"]}]}])
             else:
                 self.send_json(200, {"object": "list", "data": [{"id": "local-model"}]})

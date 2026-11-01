@@ -33,6 +33,13 @@ HYBRID_METADATA = {
     "gpt-oss.expert_used_count": 4,
 }
 
+MTP_METADATA = {
+    "general.architecture": "qwen4exp", "general.file_type": 2,
+    "qwen4exp.block_count": 2, "qwen4exp.embedding_length": 2560,
+    "qwen4exp.expert_count": 512, "qwen4exp.expert_used_count": 10,
+    "qwen4exp.expert_feed_forward_length": 640, "qwen4exp.vocab_size": 151936,
+}
+
 
 def write_metadata(path, metadata):
     def string(value):
@@ -748,6 +755,54 @@ class LocalAppTests(unittest.TestCase):
         self.assertFalse(status["hybrid_async_ids_verified"])
         self.assertIsNone(json.loads(status["logs"][0])["hybrid_async_ids"])
 
+    def test_hosted_moe_requires_markers_and_sets_validated_policy(self):
+        self.hybrid_runtime(hybrid_decode_pipeline=True, hybrid_async_ids=True, hybrid_hosted=True)
+        status = self.load()
+        self.assertTrue(status["hybrid_verified"])
+        self.assertTrue(status["hybrid_hosted"])
+        self.assertTrue(status["hybrid_hosted_verified"])
+        launch = json.loads(status["logs"][0])
+        self.assertEqual(launch["hybrid_hosted"], "1")
+        self.assertEqual(launch["host_mailbox"], "1")
+        self.assertEqual(launch["hybrid_policy"], "lfu")
+        self.assertEqual(launch["hybrid_lfu"], ["1", "6"])
+        self.assertIsNone(launch["hybrid_stage_input"])
+        self.assertIsNone(launch["hybrid_boundary"])
+        self.assertEqual(launch["hybrid_async_ids"], "1")
+        self.runtime.stop()
+        missing = self.root / "hybrid-hosted-missing.gguf"
+        write_metadata(missing, HYBRID_METADATA)
+        with mock.patch.object(self.runtime, "load_timeout", 0.4):
+            self.request("POST", "/api/v1/model/load", {"model": str(missing)})
+            status = self.wait_state("error")
+        self.assertFalse(status["hybrid_verified"])
+        self.assertIn("hosted", status["error"])
+        self.runtime.stop()
+        status = self.load(execution_mode="standard")
+        self.assertFalse(status["hybrid_hosted"])
+        launch = json.loads(status["logs"][0])
+        self.assertIsNone(launch["hybrid_hosted"])
+        self.assertIsNone(launch["host_mailbox"])
+
+    def test_hosted_moe_rejects_staged_transfer_and_mtp(self):
+        self.runtime.stop(closing=True)
+        self.hybrid_runtime(hybrid_hosted=True, hybrid_transfer="staged")
+        code, _, body = self.request("POST", "/api/v1/model/load", {"model": str(self.model)})
+        self.assertEqual(code, 400, body)
+        self.assertIn(b"direct registered transfers", body)
+        self.assertIsNone(self.runtime.process)
+        self.runtime.stop(closing=True)
+        self.hybrid_runtime(enable_speculation=True, hybrid_generic=True, execution_mode="auto", hybrid_hosted=True,
+                            hybrid_generic_transfer="direct")
+        draft = self.mtp_models()
+        code, _, body = self.request("POST", "/api/v1/model/load", {
+            "model": str(self.model), "execution_mode": "hybrid", "draft_type": "mtp",
+            "draft_model": str(draft), "draft_tokens": 4, "expert_cache_mib": 64,
+        })
+        self.assertEqual(code, 400, body)
+        self.assertIn(b"not been validated with MTP", body)
+        self.assertIsNone(self.runtime.process)
+
     def test_decode_pipeline_does_not_claim_overlap_from_configuration_alone(self):
         self.hybrid_runtime(hybrid_decode_pipeline=True)
         model = self.root / "hybrid-pipeline-pending.gguf"
@@ -912,10 +967,14 @@ class LocalAppTests(unittest.TestCase):
                 self.assertTrue(app.read_hybrid_profile(path)["hybrid_decode_pipeline"])
                 path.write_text(json.dumps({**profile, "decode_pipeline": True, "async_ids": True}))
                 self.assertTrue(app.read_hybrid_profile(path)["hybrid_async_ids"])
+                self.assertFalse(app.read_hybrid_profile(path)["hybrid_hosted"])
+                path.write_text(json.dumps({**profile, "hosted_moe": True}))
+                self.assertTrue(app.read_hybrid_profile(path)["hybrid_hosted"])
                 for changes in ({"schema_version": True}, {"backend_commit": "wrong"},
                                 {"executable": "relative"}, {"plan": None}, {"unexpected": 1},
                                 {"decode_pipeline": "true"}, {"decode_pipeline": 1},
-                                {"async_ids": "true"}, {"async_ids": 1}, {"async_ids": True}):
+                                {"async_ids": "true"}, {"async_ids": 1}, {"async_ids": True},
+                                {"hosted_moe": "true"}, {"hosted_moe": 1}):
                     path.write_text(json.dumps({**profile, **changes}))
                     with self.assertRaises(ValueError):
                         app.read_hybrid_profile(path)
@@ -1126,9 +1185,7 @@ class LocalAppTests(unittest.TestCase):
         self.hybrid_runtime()
         for extra in ({"hybrid_plan": self.plan}, {"hybrid_cuda_plugin": self.plugin},
                       {"hybrid_plan": self.plan, "hybrid_cuda_plugin": self.plugin,
-                       "backend_kind": "ik_llama.cpp"},
-                      {"hybrid_plan": self.plan, "hybrid_cuda_plugin": self.plugin,
-                       "enable_speculation": True}):
+                       "backend_kind": "ik_llama.cpp"}):
             with self.subTest(extra=extra):
                 with self.assertRaises(ValueError):
                     app.Runtime(str(self.backend), **extra)
@@ -1246,11 +1303,15 @@ class LocalAppTests(unittest.TestCase):
         status = self.load(draft_model=str(draft), draft_tokens=5, fit_target_mib=4096)
         flags = json.loads(status["logs"][0])
         self.assertEqual(status["draft_model"], str(draft))
+        self.assertEqual(status["draft_type"], "dflash")
+        self.assertTrue(status["speculation_verified"])
         self.assertEqual(status["fit_target_mib"], 4096)
         self.assertEqual(flags["spec_type"], "draft-dflash")
         self.assertEqual(flags["draft_tokens"], "5")
         self.assertEqual(flags["draft_gpu_layers"], "all")
         self.assertEqual(flags["fit_target"], "4096")
+        self.assertTrue(flags["jinja"])
+        self.assertEqual(flags["flash_attn"], "on")
         self.runtime.stop()
         self.runtime.backend_kind = "ik_llama.cpp"
         status = self.load(draft_model=str(draft), draft_tokens=9, fit_target_mib=4096)
@@ -1282,6 +1343,158 @@ class LocalAppTests(unittest.TestCase):
         self.assertIn(b"--experimental-speculation", body)
         self.assertFalse(self.runtime.status()["speculation_enabled"])
         self.assertIsNone(self.runtime.process)
+
+    def mtp_models(self):
+        write_metadata(self.model, MTP_METADATA)
+        draft = self.root / "native-mtp.gguf"
+        write_metadata(draft, {**MTP_METADATA, "qwen4exp.block_count": 3,
+                               "qwen4exp.nextn_predict_layers": 1})
+        return draft
+
+    def test_mtp_is_explicit_and_verified_in_standard_mode(self):
+        self.runtime.enable_speculation = True
+        draft = self.mtp_models()
+        status = self.load(draft_model=str(draft), draft_type="mtp")
+        flags = json.loads(status["logs"][0])
+        self.assertEqual(flags["spec_type"], "draft-mtp")
+        self.assertEqual(flags["draft_tokens"], "4")
+        self.assertEqual(flags["draft_gpu_layers"], "all")
+        self.assertFalse(flags["jinja"])
+        self.assertIsNone(flags["flash_attn"])
+        self.assertEqual(status["draft_type"], "mtp")
+        self.assertTrue(status["speculation_verified"])
+        self.runtime.stop()
+        status = self.load()
+        self.assertEqual(status["draft_type"], "none")
+        self.assertFalse(status["speculation_verified"])
+        self.assertIsNone(json.loads(status["logs"][0])["draft_model"])
+
+    def test_hybrid_mtp_uses_explicit_native_optin_and_bounded_target_batch(self):
+        self.runtime.stop(closing=True)
+        self.hybrid_runtime(enable_speculation=True, hybrid_generic=True, execution_mode="auto")
+        draft = self.mtp_models()
+        with mock.patch.dict(os.environ, {"VRAMBRIDGE_HYBRID_MTP": "0", "VRAMBRIDGE_HYBRID_BATCH": "32"}):
+            status = self.load(execution_mode="hybrid", draft_type="mtp", draft_model=str(draft),
+                               draft_tokens=4, expert_cache_mib=64)
+        flags = json.loads(status["logs"][0])
+        self.assertEqual(flags["spec_type"], "draft-mtp")
+        self.assertEqual(flags["hybrid_mtp"], "1")
+        self.assertEqual(flags["hybrid_batch"], "5")
+        self.assertEqual(flags["hybrid_plan"], "auto")
+        self.assertEqual(status["draft_type"], "mtp")
+        self.assertTrue(status["hybrid_verified"])
+        self.assertTrue(status["speculation_verified"])
+        self.runtime.stop()
+        code, _, body = self.request("POST", "/api/v1/model/load", {
+            "model": str(self.model), "execution_mode": "hybrid", "draft_type": "mtp",
+            "draft_model": str(draft), "draft_tokens": 32, "expert_cache_mib": 64,
+        })
+        self.assertEqual(code, 400, body)
+        self.assertIn(b"31 draft tokens", body)
+        self.assertIsNone(self.runtime.process)
+
+    def test_configuring_speculation_does_not_enable_a_draft_and_hybrid_dflash_stays_blocked(self):
+        self.runtime.stop(closing=True)
+        self.hybrid_runtime(enable_speculation=True)
+        status = self.load()
+        self.assertTrue(status["hybrid_verified"])
+        self.assertEqual(status["draft_type"], "none")
+        self.assertIsNone(status["draft_model"])
+        self.assertIsNone(json.loads(status["logs"][0])["hybrid_mtp"])
+        self.runtime.stop()
+        draft = self.root / "dflash.gguf"
+        draft.write_bytes(b"GGUF")
+        code, _, body = self.request("POST", "/api/v1/model/load", {
+            "model": str(self.model), "draft_type": "dflash", "draft_model": str(draft),
+        })
+        self.assertEqual(code, 400, body)
+        self.assertIn(b"Standard mode for DFlash", body)
+        self.assertIsNone(self.runtime.process)
+
+    def test_invalid_mtp_configuration_fails_before_starting_backend(self):
+        self.runtime.enable_speculation = True
+        draft = self.mtp_models()
+        for extra in ({"draft_type": "unknown"}, {"draft_type": ["mtp"]},
+                      {"draft_type": "mtp"}, {"draft_type": "none", "draft_model": str(draft)},
+                      {"draft_type": "mtp", "draft_model": str(self.model)},
+                      {"draft_type": "mtp", "draft_model": str(draft), "placement": "cpu"}):
+            code, _, body = self.request("POST", "/api/v1/model/load", {"model": str(self.model), **extra})
+            self.assertEqual(code, 400, body)
+            self.assertIsNone(self.runtime.process)
+        for changes in ({"general.architecture": "qwen4exp-mtp"},
+                        {"qwen4exp.embedding_length": 128},
+                        {"qwen4exp.nextn_predict_layers": 0},
+                        {"qwen4exp.vocab_size": 32}):
+            write_metadata(draft, {**MTP_METADATA, "qwen4exp.nextn_predict_layers": 1, **changes})
+            code, _, body = self.request("POST", "/api/v1/model/load", {
+                "model": str(self.model), "draft_type": "mtp", "draft_model": str(draft),
+            })
+            self.assertEqual(code, 400, body)
+            self.assertIn(b"Cannot use draft model", body)
+            self.assertIsNone(self.runtime.process)
+        self.runtime.backend_kind = "ik_llama.cpp"
+        code, _, body = self.request("POST", "/api/v1/model/load", {
+            "model": str(self.model), "draft_type": "mtp", "draft_model": str(draft),
+        })
+        self.assertEqual(code, 400, body)
+        self.assertIn(b"official llama.cpp", body)
+
+    def test_mtp_target_only_fallback_cannot_be_marked_ready(self):
+        self.runtime.enable_speculation = True
+        draft = self.mtp_models()
+        model = self.root / "mtp-fallback.gguf"
+        write_metadata(model, MTP_METADATA)
+        with mock.patch.object(app, "SPECULATION_VERIFICATION_TIMEOUT", 0.1):
+            code, _, body = self.request("POST", "/api/v1/model/load", {
+                "model": str(model), "draft_type": "mtp", "draft_model": str(draft),
+            })
+            self.assertEqual(code, 202, body)
+            with self.assertLogs("synapse", level="ERROR"):
+                status = self.wait_state("error")
+        self.assertFalse(status["speculation_verified"])
+        self.assertIn("Target-only fallback is not accepted", status["error"])
+        self.assertIsNotNone(self.runtime.process.poll())
+
+    def test_auto_tune_cancellation_restores_mtp_method_and_verified_draft(self):
+        self.runtime.enable_speculation = True
+        draft = self.mtp_models()
+        write_metadata(self.model, {**MTP_METADATA, "qwen4exp.context_length": 8192})
+        self.load(draft_type="mtp", draft_model=str(draft), context=4096)
+        apply = self.server.tuner._apply
+
+        def cancel_apply(runtime, settings, budget, *, restoring):
+            if not restoring:
+                self.server.tuner.cancel()
+            return apply(runtime, settings, budget, restoring=restoring)
+
+        with mock.patch.object(self.server.tuner, "_apply", side_effect=cancel_apply):
+            self.assertEqual(self.request("POST", "/api/v1/tuning/start",
+                                         {"model": str(self.model), "confirm": True})[0], 202)
+            result = self.wait_tuning("cancelled")
+        self.assertIsNone(result["recommendation"])
+        status = self.runtime.status()
+        self.assertEqual(status["draft_type"], "mtp")
+        self.assertEqual(status["draft_model"], str(draft))
+        self.assertEqual(status["context"], 4096)
+        self.assertTrue(status["speculation_verified"])
+
+    def test_hybrid_mtp_requires_backend_confirmation_of_target_verification_batch(self):
+        self.runtime.stop(closing=True)
+        self.hybrid_runtime(enable_speculation=True, hybrid_generic=True)
+        draft = self.mtp_models()
+        model = self.root / "hybrid-mtp-no-batch.gguf"
+        write_metadata(model, MTP_METADATA)
+        with mock.patch.object(app, "HYBRID_VERIFICATION_TIMEOUT", 0.1):
+            code, _, body = self.request("POST", "/api/v1/model/load", {
+                "model": str(model), "draft_type": "mtp", "draft_model": str(draft),
+                "expert_cache_mib": 64, "execution_mode": "hybrid",
+            })
+            self.assertEqual(code, 202, body)
+            with self.assertLogs("synapse", level="ERROR"):
+                status = self.wait_state("error")
+        self.assertTrue(status["speculation_verified"])
+        self.assertFalse(status["hybrid_verified"])
+        self.assertIn("Unconfirmed: mtp", status["error"])
 
     def test_process_resource_usage(self):
         self.load()

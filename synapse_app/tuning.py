@@ -19,7 +19,7 @@ from typing import Callable
 LOG = logging.getLogger("synapse.tuning")
 LOAD_FIELDS = ("model", "execution_mode", "context", "placement", "cpu_threads", "batch_threads",
                "load_mode", "expert_cache_mib", "fit_target_mib", "host_op_offload", "cpu_poll",
-               "op_offload_min_batch", "kv_cache_type", "draft_model", "draft_tokens")
+               "op_offload_min_batch", "kv_cache_type", "draft_model", "draft_type", "draft_tokens")
 ANCHORS = {"start": "cedar4821", "middle": "violet7319", "end": "quartz9067"}
 
 
@@ -34,6 +34,7 @@ class Cancelled(RuntimeError):
 def _valid_settings(settings: object) -> bool:
     return (isinstance(settings, dict) and type(settings.get("context")) is int and
             512 <= settings["context"] <= 262144 and settings.get("execution_mode") in ("standard", "hybrid") and
+            settings.get("draft_type", "none") in ("none", "dflash", "mtp") and
             settings.get("kv_cache_type", "f16") in ("f16", "q8_0"))
 
 
