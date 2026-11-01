@@ -32,8 +32,14 @@ Ask the user before committing or pushing either repository.
 - **No silent fallback.** An experimental path must be confirmed by backend log markers
   (`required_hybrid_markers`); if they are missing, loading fails with an explanation instead of quietly running
   something else.
-- **Opt-in until it wins broadly.** Features that help some models and hurt others stay behind a profile flag
-  (for example `hosted_moe`), with measured results in the docs.
+- **Engine internals are invisible to users.** Standard, hybrid (GPU + CPU expert sharing), classic vs. hosted
+  (in-graph) methods, admission policies and similar are internal. Users keep **Engine: Automatic**; the app
+  detects what the installation supports (`engine_capabilities`), starts from safe defaults, and Auto Tune measures
+  every supported engine and remembers the winner per model + machine + backend build (`EngineChoices`). New engine
+  techniques plug into that detect → measure → remember flow, not into new user-facing toggles. Manual choices
+  exist only for troubleshooting.
+- **Chosen by measurement until it wins broadly.** Techniques that help some models and hurt others are never the
+  untested default; Automatic uses them only where Auto Tune measured them faster, with results in the docs.
 - Do not change the user's installed backend, profile or saved state (`~/.config/synapse`,
   `~/.local/share/vrambridge`) without consent. Use a temporary `XDG_CONFIG_HOME` for experiments.
 - Auto Tune ([synapse_app/tuning.py](../synapse_app/tuning.py)) must work on any system: CPU-only, small GPUs,

@@ -84,8 +84,8 @@
             </section>
             <details>
               <summary>Run settings</summary>
-              <label for="execution-mode">Model execution profile</label>
-              <select id="execution-mode"><option value="auto">Automatic model-specific defaults</option><option value="standard">Standard backend (manual settings)</option><option value="hybrid">Require hybrid expert dispatch</option></select>
+              <label for="execution-mode">Engine</label>
+              <select id="execution-mode"><option value="auto">Automatic (recommended)</option><option value="standard">Standard only (manual settings)</option><option value="hybrid">GPU + CPU expert sharing only (troubleshooting)</option></select>
               <p id="profile-note">Automatic uses an installed experimental profile only when eligible. The pre-check explains selection; backend operations and memory fit still require load-time verification.</p>
               <label for="placement">Execution</label>
               <select id="placement"><option value="auto">Automatic CPU / GPU placement</option><option value="cpu">CPU only</option></select>
@@ -134,8 +134,7 @@
           <p>Measure this model on your hardware, then recommend model and app settings. Trials use synthetic local prompts; nothing is uploaded.</p>
           <label for="tuning-goal">Tuning goal</label>
           <select id="tuning-goal"><option value="balanced">Balanced daily use (up to 32K, fastest generation)</option><option value="maximum">Maximum context (up to the model limit or 256K, fastest long prompts)</option></select>
-          <label><input id="tuning-hybrid" type="checkbox"> Include experimental hybrid trials (not quality-qualified)</label>
-          <p class="hint">Balanced tests input capacity, not every thread/cache combination. Maximum Context can take an hour or more. Hybrid fitting is off; trials may fail and use smaller expert banks.</p>
+          <p class="hint">Every engine this installation supports for the model is measured, and Automatic then uses the winner on this machine. Balanced tests input capacity and generation speed, not every thread/cache combination. Maximum Context can take an hour or more.</p>
           <label><input id="tuning-consent" type="checkbox"> Allow unloading/reloading this model and running benchmarks. Other apps must wait. Cancel restores the previous model when possible.</label>
           <div class="actions"><button id="start-tuning" type="button" disabled>Start Auto Tune</button><button id="cancel-tuning" type="button" class="secondary" disabled>Cancel &amp; restore</button></div>
           <p id="tuning-status" role="status">No tuning run yet.</p>
@@ -150,7 +149,7 @@
         </section>
           <section class="settings-section" aria-labelledby="status-title">
             <p class="eyebrow">RUNTIME</p><h2 id="status-title">Know what is running</h2>
-            <p id="model-status">No model loaded.</p><p id="run-status"></p><p id="selection-reason"></p><p id="resources" role="status"></p>
+            <p id="model-status">No model loaded.</p><p id="engine-summary"></p><p id="run-status"></p><p id="selection-reason"></p><p id="resources" role="status"></p>
             <details><summary>Backend output</summary><pre id="logs">No output yet.</pre></details>
           </section>
       </div>

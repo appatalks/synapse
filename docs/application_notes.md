@@ -57,8 +57,10 @@ Balanced daily use tests up to 32K; Maximum Context can test up to the model lim
 or 256K and take an hour or more. Experimental hybrid trials require a separate
 opt-in. Tuning temporarily owns the model; cancellation restores the previous
 configuration when possible. It tests input capacity, short anchor-retrieval
-replies and fixed-length generation speed. With hybrid trials, Balanced picks
-the faster generator and Maximum Context the faster long-prompt run. It is not a
+replies and fixed-length generation speed for every engine the installation
+supports for the model. Balanced picks the faster generator and Maximum Context
+the faster long-prompt run; Automatic then reuses that choice on this machine
+([automatic engine choice](installing.md#automatic-engine-choice)). It is not a
 general answer-quality check or an exhaustive speed search.
 
 [Tuning scope, saved results and client settings](installing.md#auto-tune) ·

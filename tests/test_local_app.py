@@ -448,8 +448,88 @@ class LocalAppTests(unittest.TestCase):
             self.assertEqual(result["recommendation"]["settings"]["execution_mode"], mode)
             self.assertEqual(result["recommendation"]["selection_metric"], "generation speed")
             self.assertEqual(result["recommendation"]["decode_tokens_per_second"], speeds[mode])
-            self.assertEqual(self.runtime.status()["execution_mode"], mode)
+            status = self.runtime.status()
+            self.assertEqual(status["execution_mode"], "auto")
+            self.assertEqual(status["hybrid_active"], mode == "hybrid")
+            self.assertEqual(status["engine_source"], "measured")
             self.runtime.stop()
+
+    def test_automatic_reuses_the_measured_engine_until_settings_conflict(self):
+        model = self.tuning_hybrid_model("tuning-hybrid-decode")
+        status = self.load(model=str(model), execution_mode="auto")
+        self.assertEqual(status["engine_source"], "default")
+        self.assertIn("Run Auto Tune", status["engine_summary"])
+        self.runtime.stop()
+        self.assertEqual(self.request("POST", "/api/v1/tuning/start", {"model": str(model), "confirm": True})[0], 202)
+        self.wait_tuning("completed")
+        self.runtime.stop()
+        status = self.load(model=str(model), execution_mode="auto")
+        self.assertTrue(status["hybrid_active"])
+        self.assertEqual(status["engine_source"], "measured")
+        self.assertIn("150 tok/s vs 100 tok/s standard", status["engine_summary"])
+        self.runtime.stop()
+        status = self.load(model=str(model), execution_mode="auto", kv_cache_type="q8_0")
+        self.assertEqual(status["engine_source"], "default")
+        self.runtime.stop()
+        status = self.load(model=str(model), execution_mode="standard")
+        self.assertFalse(status["hybrid_active"])
+        self.assertEqual(status["engine_source"], "manual")
+
+    def test_auto_tune_measures_hosted_when_the_plugin_supports_it(self):
+        self.plugin = self.root / "libggml-cuda.so"
+        self.plugin.write_bytes(b"patched plugin GGML_CUDA_HOST_MAILBOX")
+        model = self.root / "tuning-hosted-decode.gguf"
+        write_metadata(model, {"general.architecture": "qwen2moe", "general.file_type": 7,
+                               "qwen2moe.block_count": 3, "qwen2moe.embedding_length": 96,
+                               "qwen2moe.feed_forward_length": 192, "qwen2moe.expert_count": 7,
+                               "qwen2moe.expert_used_count": 3, "qwen2moe.context_length": 8192})
+        self.plan = self.root / "hot experts.txt"
+        self.plan.write_text("0 1\n")
+        self.runtime = app.Runtime(str(self.backend), hybrid_plan="auto", hybrid_cuda_plugin=self.plugin,
+                                   hybrid_generic=True, hybrid_context=8192, hybrid_transfer="direct",
+                                   execution_mode="auto")
+        self.server.runtime = self.runtime
+        self.assertTrue(self.runtime.status()["engine_capabilities"]["hosted"])
+        self.assertEqual(self.request("POST", "/api/v1/tuning/start", {"model": str(model), "confirm": True})[0], 202)
+        result = self.wait_tuning("completed")
+        variants = [(trial["settings"]["execution_mode"], trial["settings"]["hybrid_variant"],
+                     trial["decode_tokens_per_second"]) for trial in result["trials"]]
+        self.assertEqual(variants, [("standard", "classic", 100.0), ("hybrid", "classic", 120.0),
+                                    ("hybrid", "hosted", 150.0)])
+        self.assertEqual(result["recommendation"]["settings"]["hybrid_variant"], "hosted")
+        status = self.runtime.status()
+        self.assertTrue(status["hybrid_hosted"])
+        self.assertEqual(json.loads(status["logs"][0])["hybrid_hosted"], "1")
+        self.assertIn("(in-graph)", status["engine_summary"])
+
+    def test_stock_plugin_does_not_offer_hosted_and_rejects_explicit_requests(self):
+        self.hybrid_runtime()
+        self.assertFalse(self.runtime.status()["engine_capabilities"]["hosted"])
+        code, _, body = self.request("POST", "/api/v1/model/load",
+                                     {"model": str(self.model), "hybrid_variant": "hosted"})
+        self.assertEqual(code, 400, body)
+        self.assertIn(b"in-graph expert calls", body)
+        self.assertIsNone(self.runtime.process)
+
+    def test_engine_choices_persist_and_reject_invalid_files(self):
+        store = self.root / "engine-choices.json"
+        choices = app._tuning.EngineChoices(store)
+        entry = {"settings": {"execution_mode": "hybrid", "hybrid_variant": "classic", "context": 8192,
+                              "placement": "auto", "cpu_threads": 8, "batch_threads": 16,
+                              "expert_cache_mib": 4096, "kv_cache_type": "f16"},
+                 "goal": "balanced", "measured_at": 1.0, "decode_tokens_per_second": 120.0,
+                 "standard_decode_tokens_per_second": 100.0}
+        machine = {"gpus": [], "ram_gib": 64}
+        choices.remember(self.model, machine, entry)
+        self.assertEqual(app._tuning.EngineChoices(store).lookup(self.model, "f16", machine), entry)
+        self.assertIsNone(app._tuning.EngineChoices(store).lookup(self.model, "f16", {**machine, "ram_gib": 32}))
+        self.assertIsNone(app._tuning.EngineChoices(store).lookup(self.model, "q8_0", machine))
+        with self.assertRaises(ValueError):
+            choices.remember(self.model, machine, {**entry, "goal": "fastest"})
+        store.write_text('{"schema_version": 1, "entries": {"x": {"settings": {}}}}')
+        reloaded = app._tuning.EngineChoices(store)
+        self.assertEqual(reloaded.entries, {})
+        self.assertIn("unsupported format", reloaded.error)
 
     def test_auto_tune_maximum_selects_hybrid_by_long_prompt_time(self):
         model = self.tuning_hybrid_model("tuning-hybrid-decode")
@@ -482,10 +562,10 @@ class LocalAppTests(unittest.TestCase):
         self.load(context=4096)
         apply = self.server.tuner._apply
 
-        def cancel_apply(runtime, settings, budget, *, restoring):
+        def cancel_apply(runtime, settings, budget, *, restoring, **extra):
             if not restoring:
                 self.server.tuner.cancel()
-            return apply(runtime, settings, budget, restoring=restoring)
+            return apply(runtime, settings, budget, restoring=restoring, **extra)
 
         with mock.patch.object(self.server.tuner, "_apply", side_effect=cancel_apply):
             self.assertEqual(self.request("POST", "/api/v1/tuning/start",
@@ -808,7 +888,13 @@ class LocalAppTests(unittest.TestCase):
 
     def test_hosted_moe_requires_markers_and_sets_validated_policy(self):
         self.hybrid_runtime(hybrid_decode_pipeline=True, hybrid_async_ids=True, hybrid_hosted=True)
+        self.assertTrue(self.runtime.status()["engine_capabilities"]["hosted"])
         status = self.load()
+        self.assertFalse(status["hybrid_hosted"])
+        self.assertEqual(status["hybrid_variant"], "classic")
+        self.assertIsNone(json.loads(status["logs"][0])["hybrid_hosted"])
+        self.runtime.stop()
+        status = self.load(hybrid_variant="hosted")
         self.assertTrue(status["hybrid_verified"])
         self.assertTrue(status["hybrid_hosted"])
         self.assertTrue(status["hybrid_hosted_verified"])
@@ -824,7 +910,7 @@ class LocalAppTests(unittest.TestCase):
         missing = self.root / "hybrid-hosted-missing.gguf"
         write_metadata(missing, HYBRID_METADATA)
         with mock.patch.object(self.runtime, "load_timeout", 0.4):
-            self.request("POST", "/api/v1/model/load", {"model": str(missing)})
+            self.request("POST", "/api/v1/model/load", {"model": str(missing), "hybrid_variant": "hosted"})
             status = self.wait_state("error")
         self.assertFalse(status["hybrid_verified"])
         self.assertIn("hosted", status["error"])
@@ -848,7 +934,8 @@ class LocalAppTests(unittest.TestCase):
     def test_hosted_moe_rejects_staged_transfer_and_mtp(self):
         self.runtime.stop(closing=True)
         self.hybrid_runtime(hybrid_hosted=True, hybrid_transfer="staged")
-        code, _, body = self.request("POST", "/api/v1/model/load", {"model": str(self.model)})
+        code, _, body = self.request("POST", "/api/v1/model/load",
+                                     {"model": str(self.model), "hybrid_variant": "hosted"})
         self.assertEqual(code, 400, body)
         self.assertIn(b"direct registered transfers", body)
         self.assertIsNone(self.runtime.process)
@@ -858,7 +945,7 @@ class LocalAppTests(unittest.TestCase):
         draft = self.mtp_models()
         code, _, body = self.request("POST", "/api/v1/model/load", {
             "model": str(self.model), "execution_mode": "hybrid", "draft_type": "mtp",
-            "draft_model": str(draft), "draft_tokens": 4, "expert_cache_mib": 64,
+            "draft_model": str(draft), "draft_tokens": 4, "expert_cache_mib": 64, "hybrid_variant": "hosted",
         })
         self.assertEqual(code, 400, body)
         self.assertIn(b"not been validated with MTP", body)
@@ -1523,10 +1610,10 @@ class LocalAppTests(unittest.TestCase):
         self.load(draft_type="mtp", draft_model=str(draft), context=4096)
         apply = self.server.tuner._apply
 
-        def cancel_apply(runtime, settings, budget, *, restoring):
+        def cancel_apply(runtime, settings, budget, *, restoring, **extra):
             if not restoring:
                 self.server.tuner.cancel()
-            return apply(runtime, settings, budget, restoring=restoring)
+            return apply(runtime, settings, budget, restoring=restoring, **extra)
 
         with mock.patch.object(self.server.tuner, "_apply", side_effect=cancel_apply):
             self.assertEqual(self.request("POST", "/api/v1/tuning/start",

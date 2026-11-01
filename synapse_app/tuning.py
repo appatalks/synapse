@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import http.client
 import json
 import logging
@@ -19,11 +20,15 @@ from typing import Callable
 LOG = logging.getLogger("synapse.tuning")
 LOAD_FIELDS = ("model", "execution_mode", "context", "placement", "cpu_threads", "batch_threads",
                "load_mode", "expert_cache_mib", "fit_target_mib", "host_op_offload", "cpu_poll",
-               "op_offload_min_batch", "kv_cache_type", "draft_model", "draft_type", "draft_tokens")
+               "op_offload_min_batch", "kv_cache_type", "draft_model", "draft_type", "draft_tokens",
+               "hybrid_variant")
+CHOICE_FIELDS = ("execution_mode", "hybrid_variant", "context", "placement", "cpu_threads", "batch_threads",
+                 "expert_cache_mib", "kv_cache_type")
+MAX_CHOICES = 256
 ANCHORS = {"start": "cedar4821", "middle": "violet7319", "end": "quartz9067"}
 DECODE_PROMPT = "Write a detailed technical explanation of how a hash table handles collisions.\n\n"
-DECODE_WARMUP_TOKENS = 32
-DECODE_TOKENS = 128
+DECODE_CHUNK_TOKENS = 128
+DECODE_MAX_CHUNKS = 6
 
 
 class TrialError(RuntimeError):
@@ -38,6 +43,7 @@ def _valid_settings(settings: object) -> bool:
     return (isinstance(settings, dict) and type(settings.get("context")) is int and
             512 <= settings["context"] <= 262144 and settings.get("execution_mode") in ("standard", "hybrid") and
             settings.get("draft_type", "none") in ("none", "dflash", "mtp") and
+            settings.get("hybrid_variant", "classic") in ("auto", "classic", "hosted") and
             settings.get("kv_cache_type", "f16") in ("f16", "q8_0"))
 
 
@@ -48,11 +54,91 @@ def client_settings(context: int) -> dict:
             "maxOutputTokens": reserve, "safetyMarginTokens": margin, "model": "local-model"}
 
 
+def _valid_choice(entry: object) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("settings"), dict):
+        return False
+    settings = entry["settings"]
+    return (set(settings) == set(CHOICE_FIELDS) and _valid_settings(settings) and
+            settings["hybrid_variant"] in ("classic", "hosted") and settings["placement"] in ("auto", "cpu") and
+            all(type(settings[key]) is int and settings[key] >= 0
+                for key in ("cpu_threads", "batch_threads", "expert_cache_mib")) and
+            type(entry.get("decode_tokens_per_second")) in (int, float) and
+            type(entry.get("standard_decode_tokens_per_second")) in (int, float) and
+            type(entry.get("measured_at")) in (int, float) and entry.get("goal") in ("balanced", "maximum"))
+
+
+class EngineChoices:
+    """Per model and machine, the execution choice Auto Tune measured as best; Automatic loads reuse it."""
+
+    def __init__(self, store: Path | None):
+        self.store = store
+        self.lock = threading.Lock()
+        self.entries: dict[str, dict] = {}
+        self.error: str | None = None
+        if store is not None and store.exists():
+            try:
+                if store.stat().st_size > 1024 * 1024:
+                    raise ValueError("Saved engine choices exceed 1 MiB.")
+                saved = json.loads(store.read_text(encoding="utf-8"))
+                if (not isinstance(saved, dict) or saved.get("schema_version") != 1 or
+                        not isinstance(saved.get("entries"), dict) or len(saved["entries"]) > MAX_CHOICES or
+                        not all(isinstance(key, str) and _valid_choice(entry)
+                                for key, entry in saved["entries"].items())):
+                    raise ValueError("Saved engine choices have an unsupported format.")
+                self.entries = saved["entries"]
+            except (OSError, ValueError) as exc:
+                LOG.error("Saved engine choices unavailable: %s", exc)
+                self.error = f"Saved engine choices unavailable: {exc}"
+
+    @staticmethod
+    def key(model: Path, kv_cache_type: str, machine: dict) -> str:
+        info = model.stat()
+        identity = {"model": str(model.resolve()), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                    "kv_cache_type": kv_cache_type, "machine": machine}
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+    def lookup(self, model: Path, kv_cache_type: str, machine: dict | None) -> dict | None:
+        if machine is None:
+            return None
+        try:
+            key = self.key(model, kv_cache_type, machine)
+        except OSError:
+            return None
+        with self.lock:
+            entry = self.entries.get(key)
+            return deepcopy(entry) if entry is not None else None
+
+    def remember(self, model: Path, machine: dict, entry: dict) -> None:
+        if not _valid_choice(entry):
+            raise ValueError("Refusing to save an invalid engine choice.")
+        key = self.key(model, entry["settings"]["kv_cache_type"], machine)
+        with self.lock:
+            entries = {**self.entries, key: deepcopy(entry)}
+            while len(entries) > MAX_CHOICES:
+                del entries[min(entries, key=lambda name: entries[name]["measured_at"])]
+            if self.store is not None:
+                self.store.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", dir=self.store.parent, prefix=".choices-",
+                                                     encoding="utf-8", delete=False) as output:
+                        temporary = Path(output.name)
+                        json.dump({"schema_version": 1, "entries": entries}, output, indent=2)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    temporary.replace(self.store)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            self.entries = entries
+
+
 class AutoTuner:
     def __init__(self, runtime, *, metadata: Callable[[Path], dict], compatible: Callable[[dict], bool],
                  layout: Callable[[dict], dict], memory: Callable[[], tuple[int, int]],
                  hardware: Callable[[], dict], cpu_threads: Callable[[], int], cpu_count: Callable[[], int],
-                 runtime_error: type[Exception], maximum: int = 262144, store: Path | None = None):
+                 runtime_error: type[Exception], maximum: int = 262144, store: Path | None = None,
+                 choices: EngineChoices | None = None, machine: Callable[[], dict | None] | None = None):
         self.runtime = runtime
         self.metadata = metadata
         self.compatible = compatible
@@ -64,6 +150,8 @@ class AutoTuner:
         self.runtime_error = runtime_error
         self.maximum = maximum
         self.store = store
+        self.choices = choices
+        self.machine = machine
         self.lock = threading.RLock()
         self.cancelled = threading.Event()
         self.worker: threading.Thread | None = None
@@ -124,10 +212,10 @@ class AutoTuner:
         if data.get("confirm") is not True:
             raise ValueError("Confirm that Auto Tune may unload the model and run local benchmarks.")
         goal = data.get("goal", "balanced")
-        hybrid = data.get("include_hybrid", False)
+        hybrid = data.get("include_hybrid")
         placement = data.get("placement", "auto")
         cache = data.get("kv_cache_type", "f16")
-        if goal not in ("balanced", "maximum") or type(hybrid) is not bool or placement not in ("auto", "cpu"):
+        if goal not in ("balanced", "maximum") or hybrid not in (None, True, False) or placement not in ("auto", "cpu"):
             raise ValueError("Select a supported tuning goal, placement and hybrid option.")
         model = data.get("model")
         if not isinstance(model, str) or not model.strip():
@@ -143,8 +231,11 @@ class AutoTuner:
         limit = metadata.get(f"{architecture}.context_length", self.maximum)
         if type(limit) is not int or limit < 512:
             raise ValueError("The model has no usable context limit.")
-        if hybrid and (not current["hybrid_available"] or placement != "auto" or not self.compatible(metadata)):
+        hybrid_possible = current["hybrid_available"] and placement == "auto" and self.compatible(metadata)
+        if hybrid and not hybrid_possible:
             raise ValueError("Hybrid trials require an installed compatible MoE profile and automatic placement.")
+        # By default every engine this installation supports for the model is measured.
+        hybrid = hybrid_possible if hybrid is None else hybrid
         total, available = self.memory()
         if available < min(4 * 1024 ** 3, total // 10):
             raise RuntimeError("Insufficient available RAM safety reserve. Free memory before starting Auto Tune.")
@@ -364,19 +455,28 @@ class AutoTuner:
             thread.join(timeout=2)
 
     def _decode(self, runtime) -> dict:
-        """Fixed-length generation after a short prompt: the speed of ordinary chat replies."""
+        """Steady generation speed after a short prompt: the speed of ordinary chat replies.
+
+        Adaptive engines keep moving hot experts onto the GPU during the first few hundred tokens, so fixed-length
+        chunks are generated until two consecutive chunks agree within 5% (at most six chunks)."""
         rates = []
-        for tokens in (DECODE_WARMUP_TOKENS, DECODE_TOKENS):
+        for _ in range(DECODE_MAX_CHUNKS):
+            self._update(detail=f"Generation chunk {len(rates) + 1}" +
+                         (f"; last {rates[-1]:.1f} tok/s" if rates else ""))
             result = self._native(runtime, "/completion", {
-                "prompt": DECODE_PROMPT, "n_predict": tokens, "ignore_eos": True, "temperature": 0,
+                "prompt": DECODE_PROMPT, "n_predict": DECODE_CHUNK_TOKENS, "ignore_eos": True, "temperature": 0,
                 "seed": 42, "cache_prompt": False}, timeout=900)
             timings = result.get("timings")
             generated = timings.get("predicted_n") if isinstance(timings, dict) else None
             rate = timings.get("predicted_per_second") if isinstance(timings, dict) else None
-            if type(generated) is not int or generated < tokens // 2 or type(rate) not in (int, float) or rate <= 0:
+            if (type(generated) is not int or generated < DECODE_CHUNK_TOKENS // 2 or
+                    type(rate) not in (int, float) or rate <= 0):
                 raise TrialError("The backend did not report a valid fixed-length generation speed.")
             rates.append(float(rate))
-        return {"decode_tokens_per_second": rates[-1], "decode_tokens": DECODE_TOKENS}
+            if len(rates) >= 2 and abs(rates[-1] - rates[-2]) <= 0.05 * rates[-2]:
+                break
+        return {"decode_tokens_per_second": rates[-1], "decode_samples": rates,
+                "decode_steady": len(rates) >= 2 and abs(rates[-1] - rates[-2]) <= 0.05 * rates[-2]}
 
     def _trial(self, runtime, settings: dict) -> dict:
         self._check(runtime)
@@ -413,7 +513,30 @@ class AutoTuner:
             self.report["trials"].append(trial)
         return trial
 
-    def _apply(self, runtime, settings: dict | None, budget: int, *, restoring: bool) -> None:
+    @staticmethod
+    def _better(candidate: dict, incumbent: dict, goal: str) -> bool:
+        # Balanced favors everyday reply speed; Maximum favors long-prompt throughput. Both need a 5% margin.
+        if goal == "balanced":
+            return candidate["decode_tokens_per_second"] >= incumbent["decode_tokens_per_second"] * 1.05
+        return candidate["request_seconds"] <= incumbent["request_seconds"] * 0.95
+
+    def _remember(self, model: str, selected: dict, standard: dict, goal: str) -> bool:
+        machine = self.machine() if self.machine is not None else None
+        if self.choices is None or machine is None:
+            return False
+        settings = {key: selected["settings"][key] for key in CHOICE_FIELDS}
+        try:
+            self.choices.remember(Path(model), machine, {
+                "settings": settings, "goal": goal, "measured_at": time.time(),
+                "decode_tokens_per_second": selected["decode_tokens_per_second"],
+                "standard_decode_tokens_per_second": standard["decode_tokens_per_second"]})
+        except (OSError, ValueError) as exc:
+            LOG.error("Could not remember the measured engine choice: %s", exc)
+            return False
+        return True
+
+    def _apply(self, runtime, settings: dict | None, budget: int, *, restoring: bool,
+               expected: dict | None = None) -> None:
         with runtime.lock:
             runtime.hybrid_context = budget
         runtime.stop()
@@ -423,13 +546,20 @@ class AutoTuner:
                 raise TrialError("RAM safety reserve prevents reloading the model; it has been left unloaded.")
             runtime.load(settings)
             loaded = self._wait_ready(runtime, restoring=restoring)
-            if loaded["context"] != settings["context"]:
-                raise TrialError(f"Applied context {loaded['context']} differs from the selected {settings['context']}.")
+            measured = expected is not None
+            expected = expected or settings
+            if loaded["context"] != expected["context"]:
+                raise TrialError(f"Applied context {loaded['context']} differs from the selected {expected['context']}.")
+            if measured and (loaded["hybrid_active"] != (expected["execution_mode"] == "hybrid") or
+                                                 (loaded["hybrid_active"] and
+                                                  loaded["hybrid_variant"] != expected["hybrid_variant"])):
+                raise TrialError("The applied engine differs from the measured choice.")
 
     def _run(self, runtime, model: str, contexts: list[int], placement: str, hybrid: bool,
              metadata: dict, previous: dict | None, cache: str, goal: str = "balanced") -> None:
         original_budget = runtime.hybrid_context
         selected = None
+        remembered = False
         final_state = "completed"
         error = None
         try:
@@ -437,40 +567,44 @@ class AutoTuner:
                 settings = {"model": model, "execution_mode": "standard", "context": context,
                             "placement": placement, "cpu_threads": min(8, self.cpu_threads()),
                             "batch_threads": min(16, self.cpu_count()), "fit_target_mib": 1024,
-                            "kv_cache_type": cache}
+                            "kv_cache_type": cache, "expert_cache_mib": 0, "hybrid_variant": "classic"}
                 trial = self._trial(runtime, settings)
                 if not trial["capacity_passed"]:
                     break
                 selected = trial
             if selected is None:
                 raise TrialError("No context passed. Review the failed trials; no app settings were recommended.")
+            standard = selected
             if hybrid:
                 context = selected["settings"]["context"]
                 bound = runtime.hybrid_plan != "auto" and runtime.hybrid_layout == self.layout(metadata)
                 baseline = runtime.hybrid_cache_mib if bound else runtime.hybrid_generic_cache_mib
                 banks = [baseline] if bound else sorted({min(baseline, size) for size in
                                                         (baseline, 6144, 4096, 2048, 1024)}, reverse=True)
+                transfer = runtime.hybrid_transfer if bound else runtime.hybrid_generic_transfer
                 with runtime.lock:
                     runtime.hybrid_context = context
+                best_hybrid = None
                 for bank in banks:
                     settings = {"model": model, "execution_mode": "hybrid", "context": context,
                                 "placement": "auto", "cpu_threads": min(8, self.cpu_threads()),
                                 "batch_threads": min(16, self.cpu_count()), "expert_cache_mib": bank,
                                 "load_mode": "auto", "host_op_offload": False, "fit_target_mib": 1024,
-                                "kv_cache_type": cache}
+                                "kv_cache_type": cache, "hybrid_variant": "classic"}
                     trial = self._trial(runtime, settings)
                     if trial["capacity_passed"]:
-                        # Balanced favors everyday reply speed; Maximum favors long-prompt throughput.
-                        if goal == "balanced":
-                            faster = trial["decode_tokens_per_second"] >= selected["decode_tokens_per_second"] * 1.05
-                        else:
-                            faster = trial["request_seconds"] <= selected["request_seconds"] * 0.95
-                        if faster:
-                            selected = trial
+                        best_hybrid = trial
+                        if runtime.hosted_capable and transfer == "direct":
+                            hosted = self._trial(runtime, {**settings, "hybrid_variant": "hosted"})
+                            if hosted["capacity_passed"] and self._better(hosted, best_hybrid, goal):
+                                best_hybrid = hosted
                         break
                     if not any(term in trial.get("error", "").lower() for term in
                                ("allocat", "out of memory", "cuda", "residency", "cache")):
                         break
+                if best_hybrid is not None and self._better(best_hybrid, selected, goal):
+                    selected = best_hybrid
+            remembered = self._remember(model, selected, standard, goal)
         except Cancelled as exc:
             final_state, error = "cancelled", str(exc)
             selected = None
@@ -485,8 +619,13 @@ class AutoTuner:
                 try:
                     settings = selected["settings"] if selected else previous
                     budget = (settings["context"] if selected and settings["execution_mode"] == "hybrid"
-                              else original_budget)
-                    self._apply(runtime, settings, budget, restoring=selected is None)
+                              and not remembered else original_budget)
+                    if remembered:
+                        # Load through Automatic so the remembered choice is what users get from now on.
+                        self._apply(runtime, {"model": model, "execution_mode": "auto", "kv_cache_type": cache},
+                                    budget, restoring=False, expected=settings)
+                    else:
+                        self._apply(runtime, settings, budget, restoring=selected is None)
                 except Cancelled as exc:
                     final_state, error, selected = "cancelled", str(exc), None
                     if not self.closed and not runtime.closed:

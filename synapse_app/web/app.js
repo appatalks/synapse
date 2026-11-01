@@ -54,7 +54,6 @@ function controls() {
   el("cancel-tuning").disabled = !tuning || actionPending;
   el("cancel-work").disabled = actionPending || status?.state === "stopping";
   el("tuning-goal").disabled = tuning || actionPending;
-  el("tuning-hybrid").disabled = tuning || actionPending || !status?.hybrid_available;
   el("tuning-consent").disabled = tuning || actionPending;
   el("browse-models").disabled = active || actionPending || browserBusy;
   el("precheck-model").disabled = !status || actionPending || modelPrecheck.busy || !el("model").value.trim();
@@ -107,6 +106,7 @@ function renderStatus() {
     : "";
   el("execution-mode").querySelector('option[value="hybrid"]').disabled = !status.hybrid_available;
   el("selection-reason").textContent = status.selection_reason || "";
+  el("engine-summary").textContent = status.model && status.engine_summary ? `Engine: ${status.engine_summary}` : "";
   el("profile-note").textContent = status.hybrid_generic
     ? "Automatic detects routed-MoE dimensions, validates plan bindings, and prefers native fitting for small weight files. Unbound layouts use a causal plan with their configured budget and transfer policy. Backend operations and coverage must verify before Ready; speedups are not universal."
     : status.hybrid_available ? "This installation uses a model-bound or explicitly supplied plan. A version-2 installation enables generic automatic fallback; other models use native execution."
@@ -229,7 +229,9 @@ function renderTuning() {
   el("tuning-trial-list").replaceChildren(...trials.map((trial) => {
     const item = document.createElement("li");
     const settings = trial.settings;
-    item.textContent = `${settings.execution_mode}, ${settings.context.toLocaleString()} context`
+    const engine = settings.execution_mode === "hybrid"
+      ? `GPU + CPU expert sharing${settings.hybrid_variant === "hosted" ? " (in-graph)" : ""}` : "standard";
+    item.textContent = `${engine}, ${settings.context.toLocaleString()} context`
       + (settings.expert_cache_mib ? `, ${settings.expert_cache_mib} MiB expert bank` : "")
       + (trial.capacity_passed ? `: passed ${trial.prompt_tokens.toLocaleString()} input tokens in ${elapsed(trial.request_seconds)}`
         + (trial.decode_tokens_per_second ? `; generation ${trial.decode_tokens_per_second.toFixed(1)} tok/s` : "")
@@ -251,7 +253,8 @@ function renderTuning() {
     contextNote();
   }
   el("tuning-summary").textContent = `${current ? "Applied" : "Previous result; not currently applied"}: `
-    + `${settings.context.toLocaleString()} context, ${settings.execution_mode}`
+    + `${settings.context.toLocaleString()} context, ${settings.execution_mode === "hybrid"
+      ? `GPU + CPU expert sharing${settings.hybrid_variant === "hosted" ? " (in-graph)" : ""}` : "standard"}`
     + (recommendation.decode_tokens_per_second ? `, ${recommendation.decode_tokens_per_second.toFixed(1)} tok/s generation` : "")
     + (recommendation.selection_metric ? ` (selected by ${recommendation.selection_metric})` : "") + ". "
     + `Verified ${recommendation.prompt_tokens_tested.toLocaleString()} input tokens and a short anchor-retrieval response. `
@@ -280,7 +283,7 @@ el("start-tuning").addEventListener("click", async () => {
     status = await request("/api/v1/tuning/start", {
       model: el("model").value, goal: el("tuning-goal").value, placement: el("placement").value,
       kv_cache_type: el("kv-cache-type").value,
-      include_hybrid: el("tuning-hybrid").checked, confirm: el("tuning-consent").checked,
+      confirm: el("tuning-consent").checked,
     });
     renderStatus();
   } catch (error) {

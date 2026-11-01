@@ -56,7 +56,7 @@ body:has(dialog[open]) { overflow: hidden; }
 .composer-options { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .composer-options label { margin: 0; }
 .composer-options select { width: auto; max-width: 100%; padding: 7px 10px; }
-#tuning-hybrid, #tuning-consent { width: auto; margin-right: 7px; }
+#tuning-consent { width: auto; margin-right: 7px; }
 #tuning-trial-list { padding-left: 20px; color: var(--muted); font-size: .77rem; line-height: 1.7; overflow-wrap: anywhere; }
 .settings-section { padding: 22px 0; border-bottom: 1px solid var(--border); }
 .settings-section:last-child { padding-bottom: 0; border: 0; }

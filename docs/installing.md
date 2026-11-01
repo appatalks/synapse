@@ -100,12 +100,18 @@ minutes each; Maximum Context can take an hour or more. RAM availability is
 checked, but OS availability includes reclaimable cache and is not a fit guarantee.
 Allocation failures are retained in the results rather than hidden.
 
-Standard execution is the default. The optional **Include experimental hybrid
-trials** checkbox tests the largest passing standard context using the installed
-compatible profile. Unbound causal layouts may try progressively smaller expert
-banks; bound training plans retain their budget. Profiles and training plans are
-not rewritten. Every passing trial also measures generation speed: a short
-prompt, a 32-token warm-up, then 128 tokens at a fixed length. The goal decides
+Auto Tune measures every engine this installation supports for the model; there
+is nothing to select. Standard execution is tried first to find the largest
+passing context. When a hybrid profile is installed and the model is a
+compatible MoE with automatic placement, GPU + CPU expert sharing is then
+tried at that context. Unbound causal layouts may try progressively smaller
+expert banks; bound training plans retain their budget. If the GPU backend
+supports in-graph expert calls, that method is tried with the same bank and
+replaces the classic method only when it is at least 5% better. Profiles and training plans are
+not rewritten. Every passing trial also measures generation speed after a short
+prompt: 128-token chunks are generated until two consecutive chunks agree within
+5% (at most six), because adaptive expert residency keeps improving during the
+first few hundred tokens. The steady chunk speed is reported. The goal decides
 which execution mode wins at the selected context:
 
 - **Balanced** selects hybrid only if its generation speed is at least 5% higher,
@@ -173,15 +179,30 @@ other routed layouts use their own causal initialization, never that plan.
 Actual tensors, capacities, registration/headroom and activation are validated
 again by the backend. Desktop load and model/context size can still cause OOM.
 
-Profiles can opt into hosted MoE execution with `"hosted_moe": true`. CPU
-experts then run inside the CUDA graph through a pinned mailbox while the GPU
-computes resident experts, with frequency-gated admissions (free slot after one
-use, replacement after six). It requires direct transfers and the CUDA plugin
-built from the patched checkout; it is rejected with MTP drafting until that
-pairing is validated. Loading fails unless the backend confirms hosted
+### Automatic engine choice
+
+Engine methods are internal; users keep **Engine: Automatic**. Without
+measurements, Automatic uses native fitting when the weights fit and GPU + CPU
+expert sharing (classic method) for larger compatible MoE models. After an Auto
+Tune run, Automatic reuses the measured winner (engine, method, context,
+threads and expert bank) for that model file, KV precision, machine and backend
+build. Choices are saved in `engine-choices.json` next to the tuning results;
+changing the model file, hardware or backend build discards them. Requesting a
+draft model or settings that conflict with the measured choice uses the
+defaults instead. The status line explains which engine runs and why.
+
+The in-graph method (hosted MoE) runs CPU experts inside the CUDA graph through
+a pinned mailbox while the GPU computes resident experts, with
+frequency-gated admissions (free slot after one use, replacement after six). It
+is available when the CUDA plugin was built from the patched checkout (detected
+from the library, or declared with `"hosted_moe": true` in the profile) and
+direct transfers are configured. It is never used with MTP drafting until that
+pairing is validated, and loading fails unless the backend confirms hosted
 execution and the LFU policy. In local screens it was about 30% faster on
-Qwen3-Coder-30B-A3B, neutral on a 512-expert Qwen3.8 model, and about 6% slower
-on gpt-oss-120b, so it stays off by default.
+Qwen3-Coder-30B-A3B, neutral on a 512-expert Qwen3.8 model and about 6% slower
+on gpt-oss-120b, which is why it is chosen by measurement rather than by
+default. Advanced API clients may still request `hybrid_variant: "classic"` or
+`"hosted"` for troubleshooting.
 
 This is **experimental Linux/NVIDIA code**, not a production-qualified model
 executor. CPU/native numerical and answer checks remain unresolved. No model

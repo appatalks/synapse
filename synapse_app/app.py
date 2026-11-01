@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import re
 import secrets
 import select
@@ -323,6 +324,31 @@ def moe_layout(metadata: dict) -> dict | None:
     return {"architecture": architecture, "file_type": metadata.get("general.file_type"), **layout}
 
 
+HOSTED_PLUGIN_MARKER = b"GGML_CUDA_HOST_MAILBOX"
+
+
+def plugin_supports_hosted(plugin: Path | None) -> bool:
+    """True when the CUDA plugin was built from the research patch with in-graph host expert calls."""
+    if plugin is None:
+        return False
+    try:
+        with plugin.open("rb") as library:
+            tail = b""
+            while chunk := library.read(8 * 1024 * 1024):
+                if HOSTED_PLUGIN_MARKER in tail + chunk:
+                    return True
+                tail = chunk[-len(HOSTED_PLUGIN_MARKER):]
+    except OSError as exc:
+        LOG.warning("Could not inspect the hybrid CUDA plugin for hosted support: %s", exc)
+    return False
+
+
+def engine_label(hybrid: bool, hosted: bool, placement: str) -> str:
+    if hybrid:
+        return "GPU + CPU expert sharing" + (" (in-graph)" if hosted else "")
+    return "CPU only" if placement == "cpu" else "Standard GPU/CPU placement"
+
+
 def supports_hybrid(metadata: dict) -> bool:
     return moe_layout(metadata) is not None
 
@@ -443,6 +469,12 @@ class Runtime:
         self.hybrid_decode_pipeline = hybrid_decode_pipeline
         self.hybrid_async_ids = hybrid_async_ids
         self.hybrid_hosted = hybrid_hosted
+        self.hosted_capable = False
+        self.active_hosted = False
+        self.engine_choices = None
+        self.machine = None
+        self.engine_source = "default"
+        self.engine_summary = None
         self.active_hybrid_transfer = self.hybrid_generic_transfer if hybrid_plan == "auto" else hybrid_transfer
         self.required_hybrid_markers = {"hybrid", "context", "coverage", "direct", "registered"} if self.active_hybrid_transfer == "direct" else {"hybrid", "context", "coverage", "staged"}
         self.hybrid_cuda_plugin = hybrid_cuda_plugin.resolve(strict=True) if hybrid_cuda_plugin is not None else None
@@ -459,6 +491,8 @@ class Runtime:
             with self.hybrid_cuda_plugin.open("rb") as plugin:
                 if not plugin.read(1):
                     raise ValueError("Hybrid CUDA plugin is empty.")
+            # A profile may declare hosted support; otherwise it is detected from the plugin itself.
+            self.hosted_capable = hybrid_hosted or plugin_supports_hosted(self.hybrid_cuda_plugin)
         self.hybrid_markers: set[str] = set()
         self.backend_kind = backend_kind
         self.enable_speculation = enable_speculation
@@ -672,7 +706,13 @@ class Runtime:
                 "hybrid_decode_pipeline": self.hybrid_active and self.hybrid_decode_pipeline,
                 "hybrid_async_ids": self.hybrid_active and self.hybrid_async_ids,
                 "hybrid_async_ids_verified": self.hybrid_active and "async-ids" in self.hybrid_markers,
-                "hybrid_hosted": self.hybrid_active and self.hybrid_hosted,
+                "hybrid_hosted": self.hybrid_active and self.active_hosted,
+                "hybrid_variant": ("hosted" if self.active_hosted else "classic") if self.hybrid_active else "auto",
+                "hybrid_active": self.hybrid_active,
+                "engine_capabilities": {"standard": True, "hybrid": self.hybrid_plan is not None,
+                                        "hosted": self.hybrid_plan is not None and self.hosted_capable},
+                "engine_source": self.engine_source,
+                "engine_summary": self.engine_summary,
                 "hybrid_hosted_verified": self.hybrid_active and {"hosted", "lfu"} <= self.hybrid_markers,
                 "hybrid_overlap_verified": self.hybrid_active and "overlap" in self.hybrid_markers,
                 "hybrid_gate_up_verified": self.hybrid_active and "gate-up" in self.hybrid_markers,
@@ -708,7 +748,26 @@ class Runtime:
                 "chat_busy": self.chat_lock.locked(),
             }
 
-    def _select_execution(self, metadata: dict, model_bytes: int, mode: str) -> dict:
+    def _learned_choice(self, model: Path, mode: str, data: dict) -> dict | None:
+        """The Auto Tune winner for this model and machine, applied only by Automatic without conflicting input."""
+        if mode != "auto" or self.engine_choices is None or self.machine is None:
+            return None
+        if data.get("draft_model") not in (None, "") or data.get("draft_type", "none") != "none":
+            return None
+        entry = self.engine_choices.lookup(model, data.get("kv_cache_type", "f16"), self.machine())
+        if entry is None:
+            return None
+        settings = entry["settings"]
+        if (settings["execution_mode"] == "hybrid" and self.hybrid_plan is None) or any(
+                key in data and data[key] != settings[key] and not (key == "hybrid_variant" and data[key] == "auto")
+                for key in ("context", "placement", "cpu_threads", "batch_threads", "expert_cache_mib",
+                            "hybrid_variant")):
+            return None
+        return {**settings, "decode_tokens_per_second": entry["decode_tokens_per_second"],
+                "standard_decode_tokens_per_second": entry["standard_decode_tokens_per_second"]}
+
+    def _select_execution(self, metadata: dict, model_bytes: int, mode: str,
+                          learned: dict | None = None) -> dict:
         hybrid = False
         selected_plan = self.hybrid_plan
         transfer = self.hybrid_transfer
@@ -748,8 +807,11 @@ class Runtime:
         if mode != "standard" and self.hybrid_plan is None:
             reason_code = "no_profile"
             reason = "No hybrid installation profile found; standard execution selected."
-        planned_context = min(self.hybrid_context if hybrid else 4096, context_limit) if context_limit else (
-            self.hybrid_context if hybrid else 4096)
+        if hybrid and learned is not None:
+            selected_cache_mib = learned["expert_cache_mib"]
+        hybrid_context = learned["context"] if learned is not None else self.hybrid_context
+        planned_context = min(hybrid_context if hybrid else 4096, context_limit) if context_limit else (
+            hybrid_context if hybrid else 4096)
         return {"hybrid": hybrid, "plan": selected_plan, "transfer": transfer,
                 "cache_mib": selected_cache_mib if hybrid else 0, "layout": layout,
                 "context": planned_context, "reason": reason, "reason_code": reason_code,
@@ -795,13 +857,25 @@ class Runtime:
         mode = data.get("execution_mode", self.default_execution_mode)
         if mode not in ("auto", "standard", "hybrid"):
             raise AppError(400, "Execution mode must be auto, standard, or hybrid.")
+        variant = data.get("hybrid_variant", "auto")
+        if variant not in ("auto", "classic", "hosted"):
+            raise AppError(400, "Hybrid variant must be auto, classic, or hosted.")
         metadata = {}
         if mode != "standard" and self.hybrid_plan is not None:
             try:
                 metadata = model_metadata(model)
             except (OSError, ValueError) as exc:
                 raise AppError(400, f"Cannot select an execution profile: {exc}") from exc
-        selection = self._select_execution(metadata, model.stat().st_size, mode)
+        learned = self._learned_choice(model, mode, data)
+        selection = self._select_execution(metadata, model.stat().st_size,
+                                           learned["execution_mode"] if learned else mode, learned)
+        if learned is not None and selection["hybrid"] != (learned["execution_mode"] == "hybrid"):
+            learned = None
+            selection = self._select_execution(metadata, model.stat().st_size, mode)
+        if learned is not None:
+            if not selection["hybrid"]:
+                selection["context"] = learned["context"]
+            selection["reason"] = "Auto Tune measured this engine and settings as the best choice on this machine."
         hybrid, selected_plan = selection["hybrid"], selection["plan"]
         transfer, selected_cache_mib = selection["transfer"], selection["cache_mib"]
         layout, planned_context = selection["layout"], selection["context"]
@@ -814,9 +888,11 @@ class Runtime:
         selected_executable = (self.hybrid_executable if hybrid else
                                self.standard_executable if self.hybrid_plan is not None else self.executable)
         context = data.get("context", planned_context)
-        placement = data.get("placement", "auto")
-        cpu_threads = data.get("cpu_threads", min(8, len(available_cpus())) if hybrid else default_cpu_threads())
-        batch_threads = data.get("batch_threads", min(16, len(available_cpus())) if hybrid else cpu_threads)
+        placement = data.get("placement", learned["placement"] if learned else "auto")
+        cpu_threads = data.get("cpu_threads", learned["cpu_threads"] if learned else
+                               min(8, len(available_cpus())) if hybrid else default_cpu_threads())
+        batch_threads = data.get("batch_threads", learned["batch_threads"] if learned else
+                                 min(16, len(available_cpus())) if hybrid else cpu_threads)
         load_mode = data.get("load_mode", "auto")
         expert_cache_mib = data.get("expert_cache_mib", selected_cache_mib if hybrid else 0)
         fit_target_mib = data.get("fit_target_mib", 1024)
@@ -892,9 +968,14 @@ class Runtime:
             raise AppError(400, "Explicit host-operation and polling tuning requires the official llama.cpp backend.")
         if type(draft_tokens) is not int or not 1 <= draft_tokens <= 32:
             raise AppError(400, "Draft tokens must be an integer between 1 and 32.")
-        if hybrid and self.hybrid_hosted and transfer != "direct":
+        hosted = hybrid and (variant == "hosted" or
+                             (variant == "auto" and learned is not None and learned["hybrid_variant"] == "hosted"))
+        if hosted and not self.hosted_capable:
+            raise AppError(400, "This installation's GPU backend was not built with in-graph expert calls; "
+                           "use the classic hybrid method.")
+        if hosted and transfer != "direct":
             raise AppError(400, "Hosted MoE execution requires direct registered transfers.")
-        if hybrid and self.hybrid_hosted and draft_type == "mtp":
+        if hosted and draft_type == "mtp":
             raise AppError(400, "Hosted MoE execution has not been validated with MTP drafting; disable one of them.")
         if hybrid and draft_type == "mtp" and draft_tokens > 31:
             raise AppError(400, "Hybrid MTP allows at most 31 draft tokens: target verification includes one additional token.")
@@ -988,7 +1069,7 @@ class Runtime:
                         VRAMBRIDGE_HYBRID_BOUNDARY="gpu", VRAMBRIDGE_HYBRID_FUSE_GATE_UP="1")
                 if self.hybrid_async_ids:
                     environment["VRAMBRIDGE_HYBRID_ASYNC_IDS"] = "1"
-                if self.hybrid_hosted:
+                if hosted:
                     # Expert calls run inside the graph; staged input and the boundary split belong to the
                     # classic dispatcher. LFU 1/6 and the CUDA mailbox were validated on three MoE families.
                     for name in ("VRAMBRIDGE_HYBRID_STAGE_INPUT", "VRAMBRIDGE_HYBRID_BOUNDARY"):
@@ -1012,7 +1093,7 @@ class Runtime:
             self.active_hybrid_transfer = transfer
             self.required_hybrid_markers = ({"hybrid", "context", "coverage", "direct", "registered"}
                                             if transfer == "direct" else {"hybrid", "context", "coverage", "staged"})
-            if hybrid and self.hybrid_hosted:
+            if hybrid and hosted:
                 self.required_hybrid_markers |= {"hosted", "lfu"}
                 if self.hybrid_decode_pipeline:
                     self.required_hybrid_markers.add("gate-up")
@@ -1023,6 +1104,21 @@ class Runtime:
             if hybrid and draft_type == "mtp":
                 self.required_hybrid_markers.add("mtp")
             self.execution_mode = mode
+            self.active_hosted = hosted
+            self.engine_source = "measured" if learned else "manual" if mode != "auto" else "default"
+            label = engine_label(hybrid, hosted, placement)
+            if learned and hybrid:
+                self.engine_summary = (f"{label}: measured fastest on this machine by Auto Tune "
+                                       f"({learned['decode_tokens_per_second']:.0f} tok/s vs "
+                                       f"{learned['standard_decode_tokens_per_second']:.0f} tok/s standard).")
+            elif learned:
+                self.engine_summary = (f"{label}: measured by Auto Tune on this machine "
+                                       f"({learned['decode_tokens_per_second']:.0f} tok/s).")
+            elif mode == "auto":
+                self.engine_summary = (f"{label}: default for this model. Run Auto Tune to measure the fastest "
+                                       "engine on this machine.")
+            else:
+                self.engine_summary = f"{label}: selected manually."
             self.selection_reason = reason
             self.error = None
             self.readiness_error = None
@@ -1119,7 +1215,7 @@ class Runtime:
                             batch = re.search(r"hybrid batch limit=(\d+); multi-position dispatch freezes residency", line)
                             if self.draft_type == "mtp" and batch and int(batch[1]) == self.draft_tokens + 1:
                                 self.hybrid_markers.add("mtp")
-                            if self.hybrid_hosted:
+                            if self.active_hosted:
                                 if "VRAMBridge hosted MoE enabled:" in line and "in-graph host expert calls" in line:
                                     self.hybrid_markers.add("hosted")
                                 if "admission policy=lfu;" in line:
@@ -1342,13 +1438,16 @@ class AppServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], runtime: Runtime, *, update_checks: bool = True,
                  tuning_store: Path | None = None):
+        self.choices = _tuning.EngineChoices(tuning_store.parent / "engine-choices.json" if tuning_store else None)
+        self._gpus: list[dict] | None = None
         self.runtime = runtime
         self.operation_lock = threading.RLock()
         self.tuner = _tuning.AutoTuner(
             lambda: self.runtime, metadata=model_metadata, compatible=supports_hybrid, layout=moe_layout,
             memory=lambda: system_probe().memory(), hardware=self._tuning_hardware,
             cpu_threads=default_cpu_threads, cpu_count=lambda: len(available_cpus()),
-            runtime_error=AppError, maximum=MAX_CONTEXT, store=tuning_store)
+            runtime_error=AppError, maximum=MAX_CONTEXT, store=tuning_store,
+            choices=self.choices, machine=self._machine)
         archive = Path(sys.argv[0]).resolve() if sys.argv[0].endswith(".pyz") else None
         self.updates = _updates.UpdateManager(__version__, archive, automatic=update_checks)
         self.restart_requested = False
@@ -1385,6 +1484,45 @@ class AppServer(ThreadingHTTPServer):
         return {"platform": snapshot["platform"],
                 "gpus": [{"name": device.get("name"), "vram_total_bytes": device.get("vram_total_bytes")}
                          for device in devices]}
+
+    @property
+    def runtime(self) -> Runtime:
+        return self._runtime
+
+    @runtime.setter
+    def runtime(self, runtime: Runtime) -> None:
+        runtime.engine_choices, runtime.machine = self.choices, self._machine
+        self._runtime = runtime
+
+    def _gpu_identity(self) -> list[dict]:
+        # Probed once directly: the live monitor only starts sampling when a client first asks for it.
+        if self._gpus is None:
+            try:
+                probe = _telemetry.NvidiaProbe()
+                try:
+                    self._gpus = [{"name": device["name"], "vram_total_bytes": device.get("vram_total_bytes")}
+                                  for device in probe.sample()]
+                finally:
+                    probe.close()
+            except OSError as exc:
+                LOG.info("No NVIDIA GPU identity for remembered engine choices: %s", exc)
+                self._gpus = []
+        return self._gpus
+
+    def _machine(self) -> dict | None:
+        """Identity of this machine and backend; remembered engine choices apply only while it is unchanged."""
+        runtime = self.runtime
+        backend = []
+        for path in (runtime.standard_executable, runtime.hybrid_executable, runtime.hybrid_cuda_plugin):
+            if path is not None:
+                try:
+                    info = Path(path).stat()
+                    backend.append([str(path), info.st_size, info.st_mtime_ns])
+                except OSError:
+                    backend.append([str(path), None, None])
+        return {"platform": platform.system(), "gpus": self._gpu_identity(), "logical_cpus": len(available_cpus()),
+                "ram_gib": round(system_probe().memory()[0] / 1024 ** 3), "backend": backend,
+                "hosted": runtime.hosted_capable}
 
     def status(self) -> dict:
         return {**self.runtime.status(), "tuning": self.tuner.snapshot()}

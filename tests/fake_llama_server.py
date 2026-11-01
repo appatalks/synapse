@@ -188,8 +188,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"content": "", "timings": {}})
                 return
             hybrid = bool(os.getenv("VRAMBRIDGE_HYBRID_PLAN"))
+            hosted = os.getenv("VRAMBRIDGE_HYBRID_HOSTED") == "1"
             rate = {"tuning-hybrid-decode": 150.0 if hybrid else 100.0,
-                    "tuning-hybrid-slow-decode": 90.0 if hybrid else 100.0}.get(Path(args.model).stem, 100.0)
+                    "tuning-hybrid-slow-decode": 90.0 if hybrid else 100.0,
+                    "tuning-hosted-decode": (150.0 if hosted else 120.0) if hybrid else 100.0,
+                    }.get(Path(args.model).stem, 100.0)
             self.send_json(200, {"content": "x" * data["n_predict"], "timings": {
                 "predicted_n": data["n_predict"], "predicted_per_second": rate,
                 "prompt_n": 18, "prompt_per_second": 900.0}})
